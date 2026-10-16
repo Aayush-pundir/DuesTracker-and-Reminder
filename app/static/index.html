@@ -1,0 +1,93 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dues Control Room</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#0f172a;--mute:#64748b;--line:#e2e8f0;--brand:#4f46e5;--ok:#059669;--warn:#d97706;--bad:#dc2626}
+@media(prefers-color-scheme:dark){:root{--bg:#0b1020;--card:#141b2f;--ink:#e5e9f5;--mute:#93a0bd;--line:#26304a;--brand:#818cf8}}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--ink)}
+header{display:flex;align-items:center;gap:16px;padding:12px 20px;background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5;flex-wrap:wrap}
+h1{font-size:17px;margin:0}nav{display:flex;gap:4px;flex-wrap:wrap}nav button{border:0;background:none;padding:7px 12px;border-radius:8px;color:var(--mute);cursor:pointer;font:inherit}
+nav button.on{background:var(--brand);color:#fff}main{padding:20px;max-width:1280px;margin:auto}
+.grid{display:grid;gap:14px}.g4{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}.g2{grid-template-columns:repeat(auto-fit,minmax(380px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px}.card h3{margin:0 0 10px;font-size:13px;color:var(--mute);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.kpi b{display:block;font-size:26px}.kpi span{color:var(--mute);font-size:12px}
+table{width:100%;border-collapse:collapse}th,td{padding:7px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{color:var(--mute);font-weight:600;font-size:12px}td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+tr.click{cursor:pointer}tr.click:hover{background:color-mix(in srgb,var(--brand) 8%,transparent)}
+.bar{height:9px;border-radius:5px;background:var(--brand);min-width:2px}.row{display:flex;align-items:center;gap:8px;margin:5px 0}.row .l{width:130px;color:var(--mute);font-size:12px;flex:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.row .v{width:86px;text-align:right;font-variant-numeric:tabular-nums;flex:none;font-size:12px}.row .t{flex:1}
+button.b,input,select{font:inherit;padding:7px 11px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink)}button.b{cursor:pointer}button.p{background:var(--brand);color:#fff;border-color:var(--brand)}button.d{color:var(--bad)}
+.tag{display:inline-block;padding:1px 8px;border-radius:99px;font-size:11px;border:1px solid var(--line);color:var(--mute)}.tag.WALLET{color:var(--warn)}.tag.AUTO_DEBIT,.tag.ok{color:var(--ok)}.tag.bad{color:var(--bad)}
+.bar2{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}.hide{display:none}.mute{color:var(--mute)}
+#drawer{position:fixed;top:0;right:0;width:min(640px,100%);height:100%;background:var(--card);border-left:1px solid var(--line);padding:18px;overflow:auto;transform:translateX(100%);transition:.2s;z-index:10;box-shadow:-8px 0 30px #0003}#drawer.open{transform:none}
+pre{white-space:pre-wrap}#toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:9px 16px;border-radius:9px;display:none;z-index:20}
+.drop{border:2px dashed var(--line);border-radius:12px;padding:18px;text-align:center}
+</style></head><body>
+<header><h1>Dues Control Room</h1><nav id="nav"></nav><span style="flex:1"></span><span id="mode" class="tag"></span></header>
+<main id="main"></main><aside id="drawer"></aside><div id="toast"></div>
+<script>
+const $=s=>document.querySelector(s), inr=n=>'₹'+Math.round(n||0).toLocaleString('en-IN');
+const api=async(p,o={})=>{const r=await fetch('/api'+p,o.body instanceof FormData?o:{headers:{'Content-Type':'application/json'},...o,body:o.body&&JSON.stringify(o.body)});
+  if(!r.ok){toast((await r.json().catch(()=>({}))).detail||r.statusText);throw 0}return r.json()};
+const toast=m=>{const t=$('#toast');t.textContent=m;t.style.display='block';clearTimeout(t._t);t._t=setTimeout(()=>t.style.display='none',3500)};
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const tabs={overview:'Overview',customers:'Customers',collect:'Collections',remind:'Reminders',resellers:'Resellers',data:'Data & Settings'};
+let cur='overview';
+$('#nav').innerHTML=Object.entries(tabs).map(([k,v])=>`<button data-k="${k}">${v}</button>`).join('');
+$('#nav').onclick=e=>{if(e.target.dataset.k)go(e.target.dataset.k)};
+function go(k){cur=k;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.k==k));views[k]()}
+const bars=(a,max)=>{max=max||Math.max(1,...a.map(x=>x.amount));return a.map(x=>`<div class="row"><span class="l" title="${esc(x.name)}">${esc(x.name)}</span><span class="t"><div class="bar" style="width:${100*x.amount/max}%"></div></span><span class="v">${inr(x.amount)}</span></div>`).join('')};
+const views={
+async overview(){const s=await api('/summary');$('#mode').textContent='Reminders: '+s.send_mode;$('#mode').className='tag '+(s.send_mode=='SMTP'?'ok':'');
+ $('#main').innerHTML=`<div class="grid g4">
+ <div class="card kpi"><span>Total outstanding</span><b>${inr(s.total)}</b><span>${s.customers_with_dues} customers</span></div>
+ <div class="card kpi"><span>Overdue</span><b style="color:var(--bad)">${inr(s.overdue)}</b><span>${Math.round(100*s.overdue/(s.total||1))}% of total</span></div>
+ <div class="card kpi"><span>Collected this month</span><b style="color:var(--ok)">${inr(s.collected_this_month.reduce((a,x)=>a+x.amount,0))}</b><span>${s.collected_this_month.map(x=>x.mode.toLowerCase()+' '+inr(x.amount)).join(' · ')||'—'}</span></div>
+ <div class="card kpi"><span>Held on platform (wallets)</span><b>${inr(s.wallet_held)}</b><span>available for deduction</span></div></div>
+ <div class="grid g4" style="margin-top:14px">
+ <div class="card kpi"><span>Next run will send</span><b>${s.plan.remind}</b><span>reminders · ${s.plan.auto_debit} auto-debits</span></div>
+ <div class="card kpi"><span>Bank credits to review</span><b>${s.bank_to_review}</b><span><a href="#" onclick="go('collect');return false">open queue →</a></span></div></div>
+ <div class="grid g2" style="margin-top:14px"><div class="card"><h3>Ageing (days past due)</h3>${bars(s.aging)}</div>
+ <div class="card"><h3>By KAM</h3>${bars(s.by_kam)}</div>
+ <div class="card"><h3>Top 10 debtors</h3>${s.top.map(t=>`<div class="row" style="cursor:pointer" onclick="openC(${t.id})"><span class="l" style="width:250px">${esc(t.name)}</span><span class="v" style="flex:1;text-align:right">${inr(t.amount)}</span></div>`).join('')}</div>
+ <div class="card"><h3>By collection route</h3>${bars(s.by_mode)}<h3 style="margin-top:14px">By type</h3>${bars(s.by_kind)}</div></div>`},
+async customers(){$('#main').innerHTML=`<div class="bar2"><input id="q" placeholder="Search customer…"><select id="kam"><option value="">All KAMs</option></select><select id="rs"><option value="0">All resellers</option></select><span class="mute" id="cnt"></span></div><div class="card" style="padding:0;overflow:auto"><table><thead><tr><th>Customer</th><th>KAM</th><th>Route</th><th>Reseller</th><th class="n">Wallet</th><th class="n">Outstanding</th><th>Oldest due</th><th>Last reminder</th></tr></thead><tbody id="tb"></tbody></table></div>`;
+ const rs=await api('/summary');$('#rs').innerHTML+=rs.resellers.map(r=>`<option value="${r.id}">${esc(r.name)}</option>`).join('');$('#kam').innerHTML+=rs.by_kam.map(r=>`<option>${esc(r.name)}</option>`).join('');
+ const load=async()=>{const l=await api(`/customers?q=${encodeURIComponent($('#q').value)}&kam=${encodeURIComponent($('#kam').value)}&reseller_id=${$('#rs').value}`);$('#cnt').textContent=l.length+' customers';
+ $('#tb').innerHTML=l.map(c=>`<tr class="click" onclick="openC(${c.id})"><td>${esc(c.name)}</td><td>${esc(c.kam)}</td><td><span class="tag ${c.collection_mode}">${c.collection_mode}${c.auto_debit_allowed?'':' · no auto-debit'}</span></td><td>${esc(c.reseller||'')}</td><td class="n">${c.wallet_balance?inr(c.wallet_balance):''}</td><td class="n"><b>${inr(c.outstanding)}</b></td><td>${c.oldest_due||''}</td><td>${c.last_reminder||'<span class=mute>never</span>'}</td></tr>`).join('')};
+ ['q','kam','rs'].forEach(i=>$('#'+i).oninput=load);load()},
+async collect(){const b=await api('/bank/review');
+ $('#main').innerHTML=`<div class="grid g2"><div class="card"><h3>1 · Bank statement (CSV / XLSX)</h3><p class="mute">Credits are matched to customers by name, amount and open invoices. Confident matches close invoices automatically (oldest first); the rest wait below.</p><input type="file" id="bf"> <button class="b p" onclick="upl('bf','/upload/bank')">Import</button></div>
+ <div class="card"><h3>2 · Record one payment / credit note</h3><div class="bar2"><input id="pc" placeholder="Customer id (from Customers tab)" size="10"><input id="pa" type="number" placeholder="Amount"><select id="pm"><option>BANK</option><option>CREDIT_NOTE</option></select><input id="pr" placeholder="UTR / ref"></div><button class="b p" onclick="pay()">Record & close invoices</button></div></div>
+ <div class="card" style="margin-top:14px;padding:0;overflow:auto"><h3 style="padding:14px 14px 0">Bank credits awaiting a decision (${b.length})</h3><table><thead><tr><th>Date</th><th class="n">Amount</th><th>Narration</th><th>Suggestion</th><th></th></tr></thead><tbody>${b.map(p=>`<tr><td>${p.received_on}</td><td class="n">${inr(p.amount)}</td><td>${esc(p.narration)}</td><td>${esc(p.suggested||'—')}</td><td>${p.suggested_customer_id?`<button class="b p" onclick="conf(${p.id},${p.suggested_customer_id})">Confirm</button>`:`<input size=6 placeholder="cust id" id="m${p.id}"><button class="b" onclick="conf(${p.id},document.getElementById('m${p.id}').value)">Assign</button>`}</td></tr>`).join('')||'<tr><td colspan=5 class="mute">Nothing to review 🎉</td></tr>'}</tbody></table></div>
+ <div class="card" style="margin-top:14px"><h3>Held-balance & auto-debit</h3><p class="mute">Customers who opted into auto-debit (and are not flagged “Do not auto debit”) are debited from their held wallet automatically before any reminder is sent. Run it manually here:</p><button class="b p" onclick="api('/autodebit/run',{method:'POST'}).then(r=>toast(r.debited.length+' customers debited'))">Run auto-debit now</button></div>`},
+async remind(){const [p,l,s]=await Promise.all([api('/reminders/plan'),api('/reminders/log'),api('/settings')]);
+ $('#main').innerHTML=`<div class="card"><h3>Today's plan — nothing here needs a human</h3><div class="bar2"><span class="tag ${s.send_mode=='SMTP'?'ok':''}">mode: ${s.send_mode}</span><button class="b p" onclick="runR('${s.send_mode}')">Run now (${s.send_mode})</button><button class="b" onclick="runR('DRY_RUN')">Dry-run</button><span class="mute">Scheduler runs this daily at 09:30 automatically.</span></div>
+ <div style="overflow:auto"><table><thead><tr><th>Customer</th><th>KAM</th><th class="n">Outstanding</th><th class="n">Days past due</th><th>Action</th><th></th></tr></thead><tbody>${p.map(x=>`<tr><td>${esc(x.customer)}</td><td>${esc(x.kam)}</td><td class="n">${inr(x.total)}</td><td class="n">${x.days_past_due}</td><td>${x.action=='REMIND'?'<span class="tag bad">Reminder '+x.stage+'</span>':'<span class="tag ok">Auto-debit '+inr(x.amount)+'</span>'}</td><td>${x.action=='REMIND'?`<button class="b" onclick="prev(${x.customer_id})">Preview</button>`:''}</td></tr>`).join('')||'<tr><td colspan=6 class="mute">Nothing due today.</td></tr>'}</tbody></table></div></div>
+ <div class="card" style="margin-top:14px;padding:0;overflow:auto"><h3 style="padding:14px 14px 0">Recent activity</h3><table><thead><tr><th>When</th><th>Customer</th><th>Stage</th><th>To</th><th class="n">Amount</th><th>Status</th></tr></thead><tbody>${l.map(x=>`<tr><td>${x.sent_at.replace('T',' ')}</td><td>${esc(x.customer)}</td><td>${x.stage}</td><td>${esc(x.to_addr)}</td><td class="n">${inr(x.outstanding)}</td><td><span class="tag ${x.status=='SENT'?'ok':x.status=='FAILED'?'bad':''}" title="${esc(x.error)}">${x.status}</span></td></tr>`).join('')}</tbody></table></div>`},
+async resellers(){const s=await api('/summary');
+ $('#main').innerHTML=`<div class="grid g4">${s.resellers.map(r=>`<div class="card kpi"><span>${esc(r.name)}</span><b>${inr(r.amount)}</b><span>${r.customers} end-customers with dues</span><br><button class="b" onclick="go('customers');setTimeout(()=>{$('#rs').value=${r.id};$('#rs').dispatchEvent(new Event('input'))},300)">View customers</button></div>`).join('')}</div><p class="mute" style="margin-top:14px">Customers are tagged to a reseller automatically (name suffix such as “-IDFC”, or e-mail domain) and can be re-tagged in the customer drawer. Dues roll up per reseller; reminders go to the end-customer (and CC the reseller if enabled).</p>`},
+async data(){const s=await api('/settings');
+ $('#main').innerHTML=`<div class="grid g2"><div class="card"><h3>Bulk update — Consolidated dues (.xlsx)</h3><p class="mute">Upload a fresh Consol file any time. It is treated as the latest snapshot: new dues appear, changed amounts update, cleared ones close. Payments recorded here are never lost.</p><input type="file" id="cf"> <button class="b p" onclick="upl('cf','/upload/consol')">Import</button></div>
+ <div class="card"><h3>Customer contacts — DuesReminder (.xlsm)</h3><input type="file" id="df"> <button class="b p" onclick="upl('df','/upload/contacts')">Import</button></div>
+ <div class="card"><h3>Zoho Books</h3><p class="mute">Set ZOHO_* environment variables, then pull open invoices straight from Zoho.</p><button class="b" onclick="api('/zoho/pull',{method:'POST'}).then(r=>toast(r.invoices+' invoices synced'))">Pull from Zoho</button></div>
+ <div class="card"><h3>Reminder policy</h3>${['send_mode','stages','repeat_every_days','min_gap_days','min_amount','escalate_stage','credit_days','default_cc','sender_name','sender_email','auto_debit_enabled'].map(k=>`<div class="row"><span class="l" style="width:150px">${k}</span><input style="flex:1" data-s="${k}" value="${esc(s[k])}"></div>`).join('')}<button class="b p" onclick="saveS()">Save</button></div></div>`}};
+async function upl(id,path){const f=document.getElementById(id).files[0];if(!f)return toast('Choose a file');const fd=new FormData();fd.append('file',f);toast('Importing…');const r=await api(path,{method:'POST',body:fd});toast(JSON.stringify(r).slice(0,160));go(cur)}
+async function pay(){const r=await api('/payments',{method:'POST',body:{customer_id:+$('#pc').value,amount:+$('#pa').value,mode:$('#pm').value,reference:$('#pr').value}});toast(`Allocated ${inr(r.allocated)}, unapplied ${inr(r.unapplied)}`);go(cur)}
+async function conf(id,c){const r=await api(`/payments/${id}/confirm`,{method:'POST',body:{customer_id:+c}});toast('Allocated '+inr(r.allocated));go(cur)}
+async function runR(m){const r=await api('/reminders/run',{method:'POST',body:{mode:m}});toast(JSON.stringify(r));go(cur)}
+async function saveS(){const b={};document.querySelectorAll('[data-s]').forEach(i=>b[i.dataset.s]=i.value);await api('/settings',{method:'PUT',body:b});toast('Saved')}
+async function prev(id){const m=await api('/reminders/preview/'+id);$('#drawer').innerHTML=`<button class="b" onclick="closeD()">Close</button><h3>${esc(m.subject)}</h3><p class="mute">To: ${esc(m.to.join('; '))}<br>CC: ${esc(m.cc.join('; '))}</p>${m.html}`;$('#drawer').classList.add('open')}
+const closeD=()=>$('#drawer').classList.remove('open');
+async function openC(id){const d=await api('/customers/'+id),c=d.customer;
+ $('#drawer').innerHTML=`<button class="b" onclick="closeD()">Close</button><h2>${esc(c.name)} <span class="mute" style="font-size:12px">#${c.id}</span></h2>
+ <div class="bar2"><label>KAM <input id="e_kam" value="${esc(c.kam)}" size=14></label><label>Route <select id="e_mode">${['BANK','WALLET','AUTO_DEBIT'].map(m=>`<option ${m==c.collection_mode?'selected':''}>${m}</option>`).join('')}</select></label><label><input type="checkbox" id="e_ad" ${c.auto_debit_allowed?'checked':''}> allow auto-debit</label><label><input type="checkbox" id="e_rm" ${c.remind?'checked':''}> send reminders</label></div>
+ <div class="bar2"><label>To <input id="e_to" value="${esc(c.email_to)}" size=40></label><label>CC <input id="e_cc" value="${esc(c.email_cc)}" size=30></label></div>
+ <div class="bar2"><button class="b p" onclick="saveC(${id})">Save</button>
+ <input id="w_amt" type="number" placeholder="Wallet ₹" style="width:110px"><button class="b" onclick="wal(${id},'topup')">Top-up</button><button class="b" onclick="wal(${id},'deduct')">Deduct vs dues</button> <span class="mute">Held: ${inr(c.wallet_balance)}</span></div>
+ <h3>Invoices</h3><table><thead><tr><th>Period</th><th>Inv / type</th><th>Due</th><th class="n">Amount</th><th class="n">Balance</th><th></th></tr></thead><tbody>${d.invoices.map(i=>`<tr><td>${i.period.slice(0,7)}</td><td>${esc(i.invoice_no||i.kind)}</td><td>${i.due_date}</td><td class="n">${inr(i.amount)}</td><td class="n">${inr(i.balance)}</td><td><span class="tag ${i.status=='CLOSED'?'ok':''}">${i.status}</span></td></tr>`).join('')}</tbody></table>
+ <h3>Payments</h3><table>${d.payments.map(p=>`<tr><td>${p.received_on}</td><td>${p.mode}</td><td class="n">${inr(p.amount)}</td><td>${esc(p.reference)}</td><td><button class="b d" onclick="rev(${p.id},${id})">undo</button></td></tr>`).join('')||'<tr><td class="mute">none</td></tr>'}</table>
+ <h3>Reminders</h3><table>${d.reminders.map(r=>`<tr><td>${r.sent_at.slice(0,10)}</td><td>stage ${r.stage}</td><td>${r.status}</td><td class="n">${inr(r.outstanding)}</td></tr>`).join('')||'<tr><td class="mute">none</td></tr>'}</table>`;
+ $('#drawer').classList.add('open')}
+async function saveC(id){await api('/customers/'+id,{method:'PATCH',body:{kam:$('#e_kam').value,collection_mode:$('#e_mode').value,auto_debit_allowed:+$('#e_ad').checked,remind:+$('#e_rm').checked,email_to:$('#e_to').value,email_cc:$('#e_cc').value}});toast('Saved');openC(id)}
+async function wal(id,k){const r=await api(`/customers/${id}/wallet/${k}`,{method:'POST',body:{amount:+$('#w_amt').value||null}});toast(k=='deduct'?'Deducted '+inr(r.deducted):'Topped up');openC(id)}
+async function rev(p,id){if(confirm('Undo this payment?')){await api(`/payments/${p}/reverse`,{method:'POST'});openC(id)}}
+go('overview');
+</script></body></html>
