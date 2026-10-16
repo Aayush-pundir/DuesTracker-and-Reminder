@@ -276,3 +276,51 @@ def test_kam_handover_preview_apply_and_filters(c):
     for bad in (("Old Kam", "old kam"), ("Nobody", "X"), ("Old Kam", "")):
         with pytest.raises(ValueError): ledger.reassign_kam(c, *bad)
     assert {k["kam"]: k["customers"] for k in ledger.kam_list(c)}["New Person"] == 1
+
+# ---------------------------------------------------------------- microsoft 365 setup
+import json as _json, base64 as _b64
+from app import channels, envfile
+
+class _R:
+    def __init__(self, status=200, j=None, headers=None): self.status_code, self._j, self.headers, self.text = status, j or {}, headers or {}, str(j)
+    def json(self): return self._j
+
+def _jwt(roles):
+    b = lambda d: _b64.urlsafe_b64encode(_json.dumps(d).encode()).decode().rstrip("=")
+    return f"{b({'alg': 'none'})}.{b({'roles': roles})}.sig"
+
+def _ms_env(monkeypatch):
+    for k, v in dict(MS_TENANT_ID="t", MS_CLIENT_ID="c", MS_CLIENT_SECRET="s", MS_SENDER="accounts@eroute.in").items(): monkeypatch.setenv(k, v)
+    channels._tok.update(v=None, exp=0)
+
+def test_verify_graph_detects_missing_consent_and_explains_bad_secret(monkeypatch):
+    _ms_env(monkeypatch)
+    monkeypatch.setattr(channels.httpx, "post", lambda *a, **k: _R(200, {"access_token": _jwt(["Mail.Send"]), "expires_in": 3600}))
+    assert channels.verify_graph()["ok"] is True
+    monkeypatch.setattr(channels.httpx, "post", lambda *a, **k: _R(200, {"access_token": _jwt([]), "expires_in": 3600}))
+    r = channels.verify_graph(); assert r["ok"] is False and "admin consent" in r["message"]
+    monkeypatch.setattr(channels.httpx, "post", lambda *a, **k: _R(401, {"error_description": "AADSTS7000215: Invalid client secret provided."}))
+    with pytest.raises(RuntimeError, match="secret is wrong"): channels.verify_graph()
+
+def test_graph_send_errors_are_translated_and_throttle_is_retried(monkeypatch):
+    _ms_env(monkeypatch); channels._tok.update(v="tok", exp=9e12); monkeypatch.setattr(channels.time, "sleep", lambda s: None)
+    calls = []
+    def post(url, **k):
+        calls.append(url); return _R(429, headers={"Retry-After": "1"}) if len(calls) == 1 else _R(202)
+    monkeypatch.setattr(channels.httpx, "post", post); channels.send_email("n", "e", ["a@x.example"], [], "s", "<p>h</p>"); assert len(calls) == 2
+    monkeypatch.setattr(channels.httpx, "post", lambda *a, **k: _R(403, {"error": {"code": "ErrorAccessDenied", "message": "Access is denied."}}))
+    with pytest.raises(RuntimeError, match="Application Access Policy"): channels.send_email("n", "e", ["a@x.example"], [], "s", "h")
+
+def test_env_file_loads_without_overriding_real_env_and_status_never_leaks(monkeypatch, tmp_path):
+    f = tmp_path / "channels.env"; f.write_text("# c\nMS_TENANT_ID=from-file\nMS_CLIENT_SECRET='topsecret'\nWA_TOKEN=zzz\n")
+    monkeypatch.setenv("MS_TENANT_ID", "real"); [monkeypatch.delenv(k, raising=False) for k in ("MS_CLIENT_SECRET", "WA_TOKEN")]
+    assert envfile.load(str(f)) == 2 and os.environ["MS_TENANT_ID"] == "real" and os.environ["MS_CLIENT_SECRET"] == "topsecret"
+    st = channels.setup_status("accounts@eroute.in"); assert st["graph"]["MS_CLIENT_SECRET"] is True and "topsecret" not in _json.dumps(st)
+    [os.environ.pop(k, None) for k in ("MS_CLIENT_SECRET", "WA_TOKEN")]
+
+def test_sender_mismatch_flag_and_send_delay_only_when_live(c, monkeypatch):
+    _ms_env(monkeypatch); monkeypatch.setenv("MS_SENDER", "other@eroute.in"); assert channels.setup_status("accounts@eroute.in")["sender_mismatch"] is True
+    slept = []; monkeypatch.setattr(reminders.time, "sleep", lambda s: slept.append(s))
+    cid = cust(c); ledger.create_invoice(c, cid, 5000, "2026-01-01"); reminders.run(c, datetime.date(2026, 3, 1), send_mode="DRY_RUN"); assert slept == []
+    sent = []; monkeypatch.setattr(reminders.channels, "send_email", lambda *a: sent.append(a))
+    db.set_setting(c, "send_delay_sec", "2"); reminders.run(c, datetime.date(2026, 3, 1), send_mode="LIVE"); assert len(sent) == 1 and slept == [2.0]

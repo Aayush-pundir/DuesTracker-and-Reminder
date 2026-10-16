@@ -16,7 +16,7 @@ pip install -r requirements.txt
 uvicorn app.main:app --port 8000        # dashboard at http://localhost:8000
 ```
 First screen offers **demo data** (fake customers - safe to click around; sending is disabled) or **Admin → one-time migration** of your Excel files.
-Reminders start in `DRY_RUN`. Going live: set `send_mode=LIVE` after configuring channels (`docs/CHANNELS.md`: `MS_*` for Microsoft 365 mail, `WA_*` for WhatsApp).
+Reminders start in `DRY_RUN`. Going live: follow **Admin → Microsoft 365 e-mail setup** (scripts in `setup/`, credentials in `data/channels.env`, see `docs/CHANNELS.md`), verify, then set `send_mode=LIVE`.
 Zoho: `ZOHO_CLIENT_ID ZOHO_CLIENT_SECRET ZOHO_REFRESH_TOKEN ZOHO_ORG_ID [ZOHO_DC=in]`. The built-in scheduler runs daily at 09:30; or cron `python -m app.jobs`.
 
 ```bash

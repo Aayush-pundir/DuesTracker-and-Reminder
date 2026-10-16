@@ -5,7 +5,7 @@ in one consolidated statement). plan() decides per party: REMIND(stage, channels
 Rules: stages by days past the oldest due date ("0:1,7:2,15:3,30:4"), repeat after the last stage, min gap between mails, dust ignored,
 disputed invoices excluded, promise-to-pay pauses chasing until the promised date, dry-run never advances stages.
 """
-import datetime, json
+import datetime, json, time
 from jinja2 import Environment
 from jinja2.sandbox import SandboxedEnvironment
 from markupsafe import Markup, escape
@@ -155,6 +155,7 @@ def _deliver(conn, s, mode, kind, pid, party, stage, ch, today=None):
         try:
             if ch == "EMAIL":
                 channels.send_email(s["sender_name"], s["sender_email"], m["to"], m["cc"], m["subject"], m["body"])
+                time.sleep(float(s.get("send_delay_sec") or 0))
             else:
                 channels.send_whatsapp(m["to"][0], m["subject"], m["params"])
         except Exception as e:

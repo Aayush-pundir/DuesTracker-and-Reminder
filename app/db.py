@@ -80,6 +80,7 @@ DEFAULT_SETTINGS = {
     "stages": "0:1,7:2,15:3,30:4",                   # days-past-due : stage number
     "repeat_every_days": "15", "min_gap_days": "5", "min_amount": "100",
     "escalate_stage": "3", "kam_emails": "{}",       # JSON {"kam name lowercase": "email"}
+    "send_delay_sec": "2",                           # pause between e-mails (Graph/Exchange throttle ~30 msgs/min per mailbox)
     "max_per_run": "40",                             # go-live safety: max parties contacted per run (largest dues first)
     "send_mode": "DRY_RUN",                          # DRY_RUN | LIVE
     "channel_email": "1", "channel_whatsapp": "0",   # global switches

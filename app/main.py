@@ -495,6 +495,21 @@ def put_template(key: str, b: TemplateIn):
 @app.get("/api/channels/status")
 def channel_status(): return channels.status()
 
+@app.get("/api/channels/setup")
+def channel_setup(): return channels.setup_status(db.get_settings(conn)["sender_email"])
+
+@app.post("/api/channels/verify-graph")
+def verify_graph():
+    try: return channels.verify_graph()
+    except Exception as e: raise HTTPException(400, str(e)[:400])
+
+SETUP_FILES = {"azure_app_registration.sh": "text/x-shellscript", "exchange_restrict_mailbox.ps1": "text/plain", "channels.env.example": "text/plain"}
+
+@app.get("/api/setup/{name}")
+def setup_file(name: str):
+    if name not in SETUP_FILES: raise HTTPException(404)
+    return FileResponse(os.path.join(os.path.dirname(__file__), "..", "setup", name), media_type=SETUP_FILES[name], filename=name)
+
 class TestSend(BaseModel):
     channel: str = "EMAIL"; to: str
 
@@ -508,7 +523,7 @@ def test_send(b: TestSend):
         else:
             channels.send_whatsapp(b.to, "dues_reminder_1", ["Test Customer", "1,000", "7", "2026-01-01"])
     except Exception as e:
-        raise HTTPException(400, str(e)[:300])
+        raise HTTPException(400, str(e)[:420])
     return {"ok": True}
 
 # ================================================================== zoho
