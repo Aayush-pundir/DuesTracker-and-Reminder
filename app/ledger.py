@@ -314,3 +314,35 @@ def merge_customers(conn, src, dst):
     conn.execute("UPDATE customers SET wallet_balance=wallet_balance+? WHERE id=?", (a["wallet_balance"], dst))
     conn.execute("DELETE FROM customers WHERE id=?", (src,))
     audit(conn, "customer_merge", f"{a['name']} (#{src}) -> {b['name']} (#{dst})"); conn.commit()
+
+
+# ------------------------------------------------------------------ KAM handover
+def kam_list(conn):
+    return [dict(r) for r in conn.execute(f"""SELECT COALESCE(NULLIF(c.kam,''),'') kam, COUNT(*) customers,
+        ROUND(COALESCE(SUM((SELECT SUM({BAL}) FROM invoices i WHERE i.customer_id=c.id AND i.status IN ('OPEN','PARTIAL'))),0)) outstanding
+        FROM customers c GROUP BY 1 ORDER BY customers DESC""")]
+
+def reassign_kam(conn, from_kam, to_kam, only_with_dues=False, apply=False):
+    """Move every customer of one KAM to another (handover). from_kam '' = customers with no KAM. Preview unless apply=True."""
+    frm, to = (from_kam or "").strip(), " ".join((to_kam or "").split()).title()
+    if not to:
+        raise ValueError("choose the KAM to move customers to")
+    if frm.lower() == to.lower():
+        raise ValueError("from and to are the same KAM")
+    rows = conn.execute(f"""SELECT c.id, c.name, COALESCE((SELECT SUM({BAL}) FROM invoices i WHERE i.customer_id=c.id AND i.status IN ('OPEN','PARTIAL')),0) due
+                            FROM customers c WHERE lower(COALESCE(c.kam,''))=lower(?)""", (frm,)).fetchall()
+    if only_with_dues:
+        rows = [r for r in rows if r["due"] > EPS]
+    if not rows:
+        raise ValueError(f"no customers found for KAM '{frm or '(none)'}'" + (" with open dues" if only_with_dues else ""))
+    known = {r[0].lower() for r in conn.execute("SELECT DISTINCT kam FROM customers WHERE kam!=''")}
+    res = {"customers": len(rows), "outstanding": round(sum(r["due"] for r in rows)), "new_kam": to.lower() not in known, "sample": [r["name"] for r in rows[:6]]}
+    if apply:
+        ids = [r["id"] for r in rows]
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]; q = ",".join("?" * len(chunk))
+            conn.execute(f"UPDATE customers SET kam=? WHERE id IN ({q})", (to, *chunk))
+            conn.executemany("INSERT INTO notes(customer_id,at,author,kind,text) VALUES(?,?,?,?,?)",
+                             [(cid, now(), "system", "NOTE", f"KAM changed: {frm or '(none)'} -> {to}") for cid in chunk])
+        audit(conn, "kam_reassign", f"{frm or '(none)'} -> {to}: {len(rows)} customers"); conn.commit()
+    return res

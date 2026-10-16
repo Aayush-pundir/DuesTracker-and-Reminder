@@ -265,3 +265,14 @@ def test_bulk_kam_rejects_conflicting_duplicate_rows_and_clears(c):
     assert len(importers.bulk_kam(c, rows)["errors"]) == 1
     importers.bulk_kam(c, xl(["customer", "kam"], [["Acme Pvt Ltd", "CLEAR"]]), apply=True)
     assert c.execute("SELECT kam FROM customers WHERE id=?", (a,)).fetchone()[0] == ""
+
+def test_kam_handover_preview_apply_and_filters(c):
+    a = cust(c, "A Ltd", kam="Old Kam"); b = cust(c, "B Ltd", kam="old kam"); d = cust(c, "C Ltd", kam="Other"); ledger.create_invoice(c, a, 700, "2026-01-01")
+    r = ledger.reassign_kam(c, "Old Kam", "new person"); assert (r["customers"], r["outstanding"], r["new_kam"]) == (2, 700, True)
+    assert c.execute("SELECT COUNT(*) FROM customers WHERE kam='New Person'").fetchone()[0] == 0           # preview saved nothing
+    r = ledger.reassign_kam(c, "Old Kam", "new person", only_with_dues=True, apply=True); assert r["customers"] == 1
+    assert c.execute("SELECT kam FROM customers WHERE id=?", (a,)).fetchone()[0] == "New Person" and c.execute("SELECT kam FROM customers WHERE id=?", (b,)).fetchone()[0] == "old kam"
+    assert "KAM changed" in c.execute("SELECT text FROM notes WHERE customer_id=?", (a,)).fetchone()[0]
+    for bad in (("Old Kam", "old kam"), ("Nobody", "X"), ("Old Kam", "")):
+        with pytest.raises(ValueError): ledger.reassign_kam(c, *bad)
+    assert {k["kam"]: k["customers"] for k in ledger.kam_list(c)}["New Person"] == 1

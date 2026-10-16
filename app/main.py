@@ -392,6 +392,17 @@ def backup_download():
         path = backup.run(conn, tag="-manual")
     return FileResponse(path, filename=os.path.basename(path), media_type="application/octet-stream")
 
+@app.get("/api/kam/list")
+def kam_list():
+    with _lock: return ledger.kam_list(conn)
+
+class KamMove(BaseModel):
+    from_kam: str = ""; to_kam: str; only_with_dues: bool = False; apply: bool = False
+
+@app.post("/api/kam/reassign")
+def kam_reassign(b: KamMove):
+    with _lock: return _err(lambda: ledger.reassign_kam(conn, b.from_kam, b.to_kam, b.only_with_dues, b.apply))
+
 @app.get("/api/duplicates/customers")
 def duplicates():
     with _lock:
