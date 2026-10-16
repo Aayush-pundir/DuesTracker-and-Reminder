@@ -245,3 +245,23 @@ def test_send_now_ignores_gap_but_respects_dryrun_and_holds(c):
 def test_bulk_customers_remind_flag_and_notes(c):
     cust(c); rows = xl(["name", "remind", "notes"], [["Acme Pvt Ltd", "no", "legal case pending"]])
     importers.bulk_customers(c, rows, apply=True); x = c.execute("SELECT remind, notes FROM customers").fetchone(); assert (x[0], x[1]) == (0, "legal case pending")
+
+def test_bulk_kam_matches_enterprise_id_then_name(c):
+    a = cust(c, "Acme Pvt Ltd", enterprise_id="ENTP-1", kam="Old Kam"); b = cust(c, "Beta Private Limited", kam="Tanisha Verma"); d = cust(c, "Gamma Ltd")
+    rows = xl(["enterprise_id", "customer", "kam"],
+              [["entp-1", "totally different name", "sumit tyagi"],       # id wins over name
+               ["", "BETA PVT LTD", "Sumit Tyagi"],                        # loose name match
+               ["ENTP-9", "Gamma Ltd", "tanisha"],                         # name match, learns the id
+               ["", "Nobody Co", "Sumit Tyagi"], ["", "Acme Pvt Ltd", ""]])
+    r = importers.bulk_kam(c, rows, apply=False); assert r["ok"] == 3 and len(r["errors"]) == 2 and r["matched_by"] == {"enterprise_id": 1, "name": 2}
+    assert c.execute("SELECT kam FROM customers WHERE id=?", (a,)).fetchone()[0] == "Old Kam"      # validate changed nothing
+    importers.bulk_kam(c, rows, apply=True)
+    got = {r["id"]: (r["kam"], r["enterprise_id"]) for r in c.execute("SELECT id,kam,enterprise_id FROM customers")}
+    assert got[a][0] == "Sumit Tyagi" and got[b][0] == "Sumit Tyagi" and got[d] == ("Tanisha", "ENTP-9")
+
+def test_bulk_kam_rejects_conflicting_duplicate_rows_and_clears(c):
+    a = cust(c, "Acme Pvt Ltd", kam="X")
+    rows = xl(["customer", "kam"], [["Acme Pvt Ltd", "A One"], ["Acme Pvt Ltd", "B Two"]])
+    assert len(importers.bulk_kam(c, rows)["errors"]) == 1
+    importers.bulk_kam(c, xl(["customer", "kam"], [["Acme Pvt Ltd", "CLEAR"]]), apply=True)
+    assert c.execute("SELECT kam FROM customers WHERE id=?", (a,)).fetchone()[0] == ""

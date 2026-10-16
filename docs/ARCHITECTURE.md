@@ -19,7 +19,7 @@ Every settlement is a `payment` + `allocations` (oldest due first, or specific i
 | New invoices | Zoho: pick a period → preview → import (dedup by Zoho id and by invoice no.; Zoho's "unpaid" is never trusted; paid-in-Zoho can land closed). Or manual / bulk Excel (ADD, UPDATE, CANCEL) |
 | Platform deductions | the ops platform is not connected, so upload its deduction file every 15 days / month (Collections → *Platform deductions file*); Today nudges when the last one is >15 days old |
 | Collections | single form, bank statement, bulk Excel (mode, TDS, invoice no.) - all validate-then-apply |
-| Master data | customer drawer or bulk Excel (credit days, reseller & %, WhatsApp, e-mails, KAM) |
+| Master data | customer drawer or bulk Excel (credit days, reseller & %, WhatsApp, e-mails, remind on/off, notes); **KAM assignment** by enterprise id and/or name (Customers → Bulk update KAM) |
 
 ## Zoho: what real data showed (read-only check of your live books)
 * Customer names match the Consol sheet where they overlap (a looser `Pvt`/`Private` match is also applied); Zoho contains many customers that are not in the dues sheet.

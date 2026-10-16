@@ -320,7 +320,7 @@ def wallet_apply(cid: int, b: Amt):
 def _bulk(kind, file, apply, **kw):
     with _lock:
         rows_ = _err(lambda: importers.read_table(_save(file)))
-        fn = {"invoices": importers.bulk_invoices, "collections": importers.bulk_collections, "customers": importers.bulk_customers}[kind]
+        fn = {"invoices": importers.bulk_invoices, "collections": importers.bulk_collections, "customers": importers.bulk_customers, "kam": importers.bulk_kam}[kind]
         return fn(conn, rows_, apply=apply, **kw)
 
 @app.post("/api/upload/invoices")
@@ -333,6 +333,9 @@ def up_collections(file: UploadFile = File(...), apply: bool = False, reduce_wal
 def up_deductions(file: UploadFile = File(...), apply: bool = False, reduce_wallet: bool = False):
     """Fortnightly/monthly file of balances deducted on the ops platform (the platform is not connected to this app)."""
     return _bulk("collections", file, apply, reduce_wallet=reduce_wallet, default_mode="WALLET")
+
+@app.post("/api/upload/kam")
+def up_kam(file: UploadFile = File(...), apply: bool = False): return _bulk("kam", file, apply)
 
 @app.post("/api/upload/customers")
 def up_customers(file: UploadFile = File(...), apply: bool = False): return _bulk("customers", file, apply)

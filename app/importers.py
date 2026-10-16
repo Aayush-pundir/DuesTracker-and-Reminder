@@ -178,6 +178,9 @@ TEMPLATES = {
     "deductions": (["customer", "date", "amount", "reference", "invoice_no", "narration"],
                    [["Acme Retail Pvt Ltd", "2026-10-15", 5000, "OPS-BATCH-OCT-1", "", "Deducted from platform balance"]],
                    "Fortnightly / monthly file of balances deducted on the ops platform. Every row settles that customer's oldest dues (or the invoice_no given). Mode is WALLET automatically."),
+    "kam": (["enterprise_id", "customer", "kam"],
+            [["ENTP32EC6B4AF7F648B79CD8E5F9F6E0CB71", "Shubham Housing Development Finance", "Akanksha Gupta"], ["", "Acme Retail Pvt Ltd", "Tanisha Verma"]],
+            "Matched on enterprise_id first, then on customer name (spelling of Pvt/Private/Ltd is ignored). Give either or both. Blank kam is ignored; to clear a KAM write CLEAR."),
     "customers": (["name", "kam", "contact_person", "email_to", "email_cc", "whatsapp", "credit_days", "reseller", "reseller_share_pct", "wallet_balance", "collection_mode", "auto_debit_allowed", "remind", "status", "notes"],
                   [["Acme Retail Pvt Ltd", "Tanisha Verma", "Ravi", "accounts@acme.com", "", "919810012345", 15, "", "", 0, "BANK", "yes", "yes", "ACTIVE", ""]],
                   "Upsert by name; blank cells are left unchanged. reseller_share_pct = % of each new invoice the reseller pays."),
@@ -311,6 +314,52 @@ def bulk_customers(conn, rows, apply=False):
         except Exception as e:
             out["errors"].append(f"row {n}: {e}")
     if apply: conn.commit(); audit(conn, "bulk_customers", f"ok={out['ok']} err={len(out['errors'])}")
+    out["preview"] = out["preview"][:15]; return out
+
+# ------------------------------------------------------------------ bulk: KAM assignment (by enterprise id and / or name)
+def bulk_kam(conn, rows, apply=False):
+    out = {"ok": 0, "errors": [], "preview": [], "by_kam": {}, "matched_by": {"enterprise_id": 0, "name": 0}}
+    by_eid = {}
+    for c in conn.execute("SELECT id,name,enterprise_id FROM customers WHERE COALESCE(enterprise_id,'')!=''"):
+        by_eid.setdefault(str(c["enterprise_id"]).strip().lower(), []).append(c["id"])
+    by_name, by_key = {}, {}
+    for c in conn.execute("SELECT id,name FROM customers"):
+        by_name[_key(c["name"])] = c["id"]; by_key.setdefault(ledger.name_key(c["name"]), []).append(c["id"])
+    seen = {}
+    for n, r in enumerate(rows, start=2):
+        try:
+            eid = str(r.get("enterprise_id") or r.get("enterpriseid") or "").strip()
+            nm = r.get("customer") or r.get("name") or r.get("customer_name") or r.get("name_of_customer")
+            raw = str(r.get("kam") or "").strip()
+            if not raw: raise ValueError("kam is blank")
+            if not eid and not nm: raise ValueError("need enterprise_id or customer name")
+            cid, how = None, None
+            if eid:
+                ids = by_eid.get(eid.lower(), [])
+                if len(ids) > 1: raise ValueError(f"enterprise id {eid} belongs to {len(ids)} customers")
+                if ids: cid, how = ids[0], "enterprise_id"
+            if cid is None and nm:
+                cid = by_name.get(_key(nm))
+                if cid is None:
+                    hits = by_key.get(ledger.name_key(nm), [])
+                    cid = hits[0] if len(hits) == 1 else None
+                how = "name" if cid else None
+            if cid is None:
+                raise ValueError(f"no customer found for {eid or nm}")
+            if cid in seen and seen[cid] != raw.title():
+                raise ValueError(f"customer appears twice with different KAMs ({seen[cid]} / {raw.title()})")
+            seen[cid] = raw.title(); kam = "" if raw.upper() == "CLEAR" else raw.title()
+            out["by_kam"][kam or "(cleared)"] = out["by_kam"].get(kam or "(cleared)", 0) + 1; out["matched_by"][how] += 1
+            out["preview"].append(f"{nm or eid} → {kam or 'cleared'} (by {how})")
+            if apply:
+                conn.execute("UPDATE customers SET kam=? WHERE id=?", (kam, cid))
+                if eid and not conn.execute("SELECT COALESCE(enterprise_id,'') FROM customers WHERE id=?", (cid,)).fetchone()[0]:
+                    conn.execute("UPDATE customers SET enterprise_id=? WHERE id=?", (eid, cid))     # learn the id when we matched by name
+            out["ok"] += 1
+        except Exception as e:
+            out["errors"].append(f"row {n}: {e}")
+    if apply:
+        normalize_kams(conn); conn.commit(); audit(conn, "bulk_kam", f"ok={out['ok']} err={len(out['errors'])} {out['by_kam']}")
     out["preview"] = out["preview"][:15]; return out
 
 # ------------------------------------------------------------------ bank statement
