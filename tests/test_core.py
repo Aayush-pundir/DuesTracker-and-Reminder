@@ -166,3 +166,40 @@ def test_template_sandbox_blocks_unsafe_expressions(c):
 
 def test_indian_number_format():
     assert reminders.inr(709855) == "7,09,855" and reminders.inr(1796313) == "17,96,313" and reminders.inr(950) == "950"
+
+# ---------------------------------------------------------------- zoho hold / file import / deductions
+def test_zoho_open_invoices_are_held_until_released(c):
+    cid = cust(c, "Acme Private Limited")
+    z = [dict(invoice_id="9", customer_id="Z9", customer_name="ACME PVT LTD", invoice_number="ZZ-9", date="2026-08-01", due_date="2026-08-01",
+              total=1000, balance=1000, status="overdue", email="accounts@eroute.in")]
+    r = zoho.import_invoices(c, z); assert r["created"] == 1 and r["held"] == 1 and r["new_customers"] == 0      # loose name match, no duplicate customer
+    assert c.execute("SELECT credit_days FROM customers WHERE id=?", (cid,)).fetchone()[0] == 15
+    assert reminders.plan(c, datetime.date(2026, 10, 1)) == []                                                   # held -> never chased
+    assert ledger.release_hold(c, source="ZOHO") == 1
+    assert reminders.plan(c, datetime.date(2026, 10, 1))[0]["action"] == "REMIND"
+
+def test_zoho_new_customer_does_not_copy_our_own_mailbox(c):
+    z = [dict(invoice_id="1", customer_id="Z1", customer_name="Brand New Co", invoice_number="N-1", date="2026-08-01", due_date="2026-08-01",
+              total=500, balance=500, status="sent", email="accounts@eroute.in")]
+    zoho.import_invoices(c, z); assert c.execute("SELECT email_to FROM customers WHERE name='Brand New Co'").fetchone()[0] == ""
+
+def test_zoho_export_file_rows_are_normalised(c):
+    rows = xl(["Invoice Date", "Invoice Number", "Invoice Status", "Customer Name", "Total", "Balance", "Due Date"],
+              [["2026-09-30", "INV-5", "Partially Paid", "File Co", 1000, 400, "2026-09-30"], ["", "bad", "", "", "", "", ""]])
+    inv = zoho.invoices_from_rows(rows); assert len(inv) == 1 and inv[0]["status"] == "partially_paid" and inv[0]["invoice_id"] == "file:INV-5"
+    r = zoho.import_invoices(c, inv, hold_open=False)
+    cid = c.execute("SELECT id FROM customers WHERE name='File Co'").fetchone()[0]; assert ledger.outstanding(c, cid) == 400
+
+def test_deductions_file_defaults_to_wallet_mode(c):
+    cid = cust(c); months(c, cid)
+    rows = xl(["customer", "date", "amount", "reference"], [["Acme Pvt Ltd", "2025-04-15", 1500, "OPS-1"]])
+    r = importers.bulk_collections(c, rows, apply=True, default_mode="WALLET"); assert r["ok"] == 1
+    assert c.execute("SELECT mode FROM payments").fetchone()[0] == "WALLET" and ledger.outstanding(c, cid) == 4500
+
+def test_zoho_file_without_customer_ids_never_cross_assigns(c):
+    a = cust(c, "Acme Pvt Ltd")
+    rows = xl(["Invoice Date", "Invoice Number", "Invoice Status", "Customer Name", "Total", "Balance"],
+              [["2026-09-30", "A-1", "Sent", "Acme Pvt Ltd", 100, 100], ["2026-09-30", "B-1", "Sent", "Other Co", 200, 200], ["2026-09-30", "C-1", "Paid", "Third Co", 300, 0]])
+    zoho.import_invoices(c, zoho.invoices_from_rows(rows))
+    got = {r[0]: r[1] for r in c.execute("SELECT i.invoice_no, c.name FROM invoices i JOIN customers c ON c.id=i.customer_id")}
+    assert got == {"A-1": "Acme Pvt Ltd", "B-1": "Other Co", "C-1": "Third Co"}

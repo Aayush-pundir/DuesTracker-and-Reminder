@@ -26,12 +26,12 @@ BAL = "i.amount - COALESCE((SELECT SUM(a.amount) FROM allocations a WHERE a.invo
 def open_invoices(conn, customer_id, payer="CUSTOMER", include_disputed=True):
     """FIFO order. payer=None -> both parts."""
     q = f"""SELECT i.*, {BAL} AS balance FROM invoices i WHERE i.customer_id=? AND i.status IN ('OPEN','PARTIAL')
-            AND (? IS NULL OR i.payer=?) AND (?=1 OR i.disputed=0) ORDER BY i.due_date, i.period, i.id"""
+            AND (? IS NULL OR i.payer=?) AND (?=1 OR (i.disputed=0 AND i.hold=0)) ORDER BY i.due_date, i.period, i.id"""
     return conn.execute(q, (customer_id, payer, payer, 1 if include_disputed else 0)).fetchall()
 
 def open_invoices_reseller(conn, reseller_id, include_disputed=True):
     q = f"""SELECT i.*, c.name AS customer_name, {BAL} AS balance FROM invoices i JOIN customers c ON c.id=i.customer_id
-            WHERE c.reseller_id=? AND i.payer='RESELLER' AND i.status IN ('OPEN','PARTIAL') AND (?=1 OR i.disputed=0)
+            WHERE c.reseller_id=? AND i.payer='RESELLER' AND i.status IN ('OPEN','PARTIAL') AND (?=1 OR (i.disputed=0 AND i.hold=0))
             ORDER BY i.due_date, i.period, i.id"""
     return conn.execute(q, (reseller_id, 1 if include_disputed else 0)).fetchall()
 
@@ -51,7 +51,7 @@ def refresh_invoice(conn, invoice_id):
 
 # ------------------------------------------------------------------ invoices (source of truth lives here)
 def create_invoice(conn, customer_id, amount, invoice_date=None, kind="OTHER", invoice_no="", description="",
-                   source="MANUAL", period=None, zoho_invoice_id=None, credit_days=None, split=True, commit=True):
+                   source="MANUAL", period=None, zoho_invoice_id=None, credit_days=None, split=True, commit=True, hold=0, hold_reason=""):
     """Create an invoice for a customer; if the customer has a reseller share, create the reseller part too.
     Returns list of invoice ids. Unapplied advances of the customer/reseller are applied automatically."""
     c = conn.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
@@ -72,8 +72,8 @@ def create_invoice(conn, customer_id, amount, invoice_date=None, kind="OTHER", i
     for payer, a in parts:
         try:
             cur = conn.execute("""INSERT INTO invoices(customer_id,payer,kind,period,invoice_no,description,invoice_date,due_date,amount,
-                split_group,source,zoho_invoice_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (customer_id, payer, kind, period, invoice_no, description, invoice_date, dd, a, gid, source, zoho_invoice_id, now()))
+                split_group,source,zoho_invoice_id,created_at,hold,hold_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (customer_id, payer, kind, period, invoice_no, description, invoice_date, dd, a, gid, source, zoho_invoice_id, now(), hold, hold_reason))
         except Exception as e:
             if "UNIQUE" in str(e):
                 raise ValueError(f"invoice already exists ({kind} {period} {invoice_no or '-'})")
@@ -120,6 +120,17 @@ def restore_invoice(conn, invoice_id):
 def set_dispute(conn, invoice_id, disputed, note=""):
     conn.execute("UPDATE invoices SET disputed=?, dispute_note=? WHERE id=?", (1 if disputed else 0, note, invoice_id))
     audit(conn, "invoice_dispute", f"{invoice_id} {disputed} {note}"); conn.commit()
+
+def release_hold(conn, source=None, date_from=None, date_to=None, invoice_ids=None):
+    """Put held invoices into normal chasing. Filters are optional; returns number released."""
+    w, a = ["hold=1"], []
+    if source: w.append("source=?"); a.append(source)
+    if date_from: w.append("invoice_date>=?"); a.append(date_from)
+    if date_to: w.append("invoice_date<=?"); a.append(date_to)
+    if invoice_ids: w.append("id IN (%s)" % ",".join("?" * len(invoice_ids))); a += list(invoice_ids)
+    n = conn.execute("UPDATE invoices SET hold=0, hold_reason='' WHERE " + " AND ".join(w), a).rowcount
+    audit(conn, "release_hold", f"{n} invoices {source or ''} {date_from or ''}..{date_to or ''}"); conn.commit()
+    return n
 
 def recompute_due_dates(conn, customer_id):
     c = conn.execute("SELECT credit_days FROM customers WHERE id=?", (customer_id,)).fetchone()

@@ -175,6 +175,9 @@ TEMPLATES = {
                     [["Acme Retail Pvt Ltd", "2026-10-15", "BANK", 20000, 500, "UTR123456", "", "NEFT Acme"],
                      ["Acme Retail Pvt Ltd", "2026-10-16", "WALLET", 5000, 0, "OPS-77", "INV-1001", "Deducted from wallet"]],
                     "mode = BANK | WALLET | AUTO_DEBIT | CREDIT_NOTE. customer may also be a reseller name. tds = tax withheld (settles the invoice too). invoice_no optional - blank = oldest dues first."),
+    "deductions": (["customer", "date", "amount", "reference", "invoice_no", "narration"],
+                   [["Acme Retail Pvt Ltd", "2026-10-15", 5000, "OPS-BATCH-OCT-1", "", "Deducted from platform balance"]],
+                   "Fortnightly / monthly file of balances deducted on the ops platform. Every row settles that customer's oldest dues (or the invoice_no given). Mode is WALLET automatically."),
     "customers": (["name", "kam", "contact_person", "email_to", "email_cc", "whatsapp", "credit_days", "reseller", "reseller_share_pct", "wallet_balance", "collection_mode", "auto_debit_allowed", "status"],
                   [["Acme Retail Pvt Ltd", "Tanisha Verma", "Ravi", "accounts@acme.com", "", "919810012345", 15, "", "", 0, "BANK", "yes", "ACTIVE"]],
                   "Upsert by name; blank cells are left unchanged. reseller_share_pct = % of each new invoice the reseller pays."),
@@ -243,7 +246,7 @@ def bulk_invoices(conn, rows, apply=False):
     out["preview"] = out["preview"][:15]; return out
 
 # ------------------------------------------------------------------ bulk: collections
-def bulk_collections(conn, rows, apply=False, reduce_wallet=False):
+def bulk_collections(conn, rows, apply=False, reduce_wallet=False, default_mode="BANK"):
     out = {"ok": 0, "errors": [], "total": 0.0, "preview": []}
     for n, r in enumerate(rows, start=2):
         try:
@@ -254,7 +257,7 @@ def bulk_collections(conn, rows, apply=False, reduce_wallet=False):
             if not cid and not rid:
                 raise ValueError(f"unknown customer/reseller '{name}'")
             d = _date(r.get("date")) or (_ for _ in ()).throw(ValueError("bad date"))
-            mode = str(r.get("mode") or "BANK").strip().upper().replace(" ", "_")
+            mode = str(r.get("mode") or default_mode).strip().upper().replace(" ", "_")
             if mode not in ("BANK", "WALLET", "AUTO_DEBIT", "CREDIT_NOTE"):
                 raise ValueError(f"bad mode '{mode}'")
             amt, tds = _num(r.get("amount")), _num(r.get("tds"))

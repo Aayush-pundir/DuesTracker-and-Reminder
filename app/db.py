@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS invoices(
   invoice_date TEXT NOT NULL, due_date TEXT NOT NULL, amount REAL NOT NULL,
   status TEXT DEFAULT 'OPEN',           -- OPEN | PARTIAL | CLOSED | CANCELLED
   disputed INTEGER DEFAULT 0, dispute_note TEXT DEFAULT '',
+  hold INTEGER DEFAULT 0, hold_reason TEXT DEFAULT '',   -- hold=1: not chased until released (e.g. Zoho import awaiting reconciliation)
   split_group INTEGER, source TEXT DEFAULT 'MANUAL',  -- MIGRATION | MANUAL | BULK | ZOHO
   zoho_invoice_id TEXT, created_at TEXT,
   UNIQUE(customer_id, payer, kind, period, invoice_no)
@@ -95,8 +96,16 @@ def connect():
     c.execute("PRAGMA foreign_keys=ON"); c.execute("PRAGMA journal_mode=WAL")
     return c
 
+def _migrate(conn):
+    """Add columns introduced after a DB file was first created."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(invoices)")}
+    for name, ddl in (("hold", "INTEGER DEFAULT 0"), ("hold_reason", "TEXT DEFAULT ''")):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE invoices ADD COLUMN {name} {ddl}")
+
 def init(conn):
     conn.executescript(SCHEMA)
+    _migrate(conn)
     for k, v in DEFAULT_SETTINGS.items():
         conn.execute("INSERT OR IGNORE INTO settings VALUES(?,?)", (k, v))
     for name, doms, marks in (("IDFC FIRST Bank", "idfcfirstbank.com", "-IDFC"), ("Stride One", "strideone.in", "")):

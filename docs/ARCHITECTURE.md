@@ -17,8 +17,16 @@ Every settlement is a `payment` + `allocations` (oldest due first, or specific i
 |---|---|
 | Initial history | Admin → one-time migration of Consol + DuesReminder files, then **Finish & lock** (endpoints return 409 afterwards) |
 | New invoices | Zoho: pick a period → preview → import (dedup by Zoho id and by invoice no.; Zoho's "unpaid" is never trusted; paid-in-Zoho can land closed). Or manual / bulk Excel (ADD, UPDATE, CANCEL) |
+| Platform deductions | the ops platform is not connected, so upload its deduction file every 15 days / month (Collections → *Platform deductions file*); Today nudges when the last one is >15 days old |
 | Collections | single form, bank statement, bulk Excel (mode, TDS, invoice no.) - all validate-then-apply |
 | Master data | customer drawer or bulk Excel (credit days, reseller & %, WhatsApp, e-mails, KAM) |
+
+## Zoho: what real data showed (read-only check of your live books)
+* Customer names match the Consol sheet where they overlap (a looser `Pvt`/`Private` match is also applied); Zoho contains many customers that are not in the dues sheet.
+* Zoho's due date always equals the invoice date, so it is ignored - terms come from the customer (Net 15).
+* Most Zoho invoices read "overdue" because receipts were never marked in Zoho. Therefore **imported open invoices land `on hold`** (not chased) until you upload the bank / deduction files and press *Release*. Invoices Zoho shows as paid land already closed.
+* No API access yet? Export Invoices from Zoho Books (CSV/XLSX) and upload it in Invoices → Zoho card - same preview/import rules.
+* Reseller split for old dues: already reflected in the amounts in your sheet; the % in the app applies only to invoices created after migration.
 
 ## Reminders (`app/reminders.py`, `app/channels.py`)
 Parties = customers + resellers. Stages by days past oldest due date (`0:1,7:2,15:3,30:4`), repeat every 15 d, ≥5 d between contacts, dust ignored, **disputed invoices excluded**, **promise-to-pay pauses chasing** (broken promises surface for a call), KAM escalated in CC from stage 3, `max_per_run` go-live cap, DRY_RUN never advances stages and demo data can never be sent. Channels: e-mail (Microsoft Graph / SMTP) and WhatsApp (Cloud API templates) - see `docs/CHANNELS.md`. Messages are editable templates.

@@ -75,11 +75,14 @@ def today_worklist():
         upcoming = rows(base + " WHERE c.promise_date>=? AND c.promise_date<=? ORDER BY c.promise_date", iso, soon)
         no_contact = rows(base + " WHERE c.status='ACTIVE' AND c.remind=1 AND TRIM(c.email_to)='' AND TRIM(c.whatsapp)='' AND due>=100 ORDER BY due DESC LIMIT 30")
         no_split = rows(f"""SELECT c.id,c.name,r.name reseller FROM customers c JOIN resellers r ON r.id=c.reseller_id
-                            WHERE c.reseller_share_pct=0 AND EXISTS (SELECT 1 FROM invoices i WHERE i.customer_id=c.id AND i.status IN ('OPEN','PARTIAL')) ORDER BY c.name LIMIT 50""")
+                            WHERE c.reseller_share_pct=0 AND EXISTS (SELECT 1 FROM invoices i WHERE i.customer_id=c.id AND i.source!='MIGRATION') ORDER BY c.name LIMIT 50""")
         disputes = rows(f"""SELECT i.id, c.id customer_id, c.name, i.invoice_no, i.dispute_note, {BAL} bal FROM invoices i JOIN customers c ON c.id=i.customer_id
                             WHERE i.disputed=1 AND i.status IN ('OPEN','PARTIAL')""")
         plan = reminders.plan(conn)
-        return {"broken_promises": broken, "promises_soon": upcoming, "bank_review": rows("SELECT id,received_on,amount,narration FROM payments WHERE status IN ('UNMATCHED','SUGGESTED') ORDER BY received_on DESC LIMIT 20"),
+        held = rows(f"""SELECT COUNT(*) n, COALESCE(SUM({BAL}),0) amt FROM invoices i WHERE i.hold=1 AND i.status IN ('OPEN','PARTIAL')""")[0]
+        ld = conn.execute("SELECT MAX(received_on) FROM payments WHERE mode IN ('WALLET','AUTO_DEBIT') AND status='ALLOCATED'").fetchone()[0]
+        return {"held": held, "last_deduction": ld, "deduction_age_days": (TODAY() - datetime.date.fromisoformat(ld)).days if ld else None,
+                "broken_promises": broken, "promises_soon": upcoming, "bank_review": rows("SELECT id,received_on,amount,narration FROM payments WHERE status IN ('UNMATCHED','SUGGESTED') ORDER BY received_on DESC LIMIT 20"),
                 "to_remind": [p for p in plan if p["action"] == "REMIND"][:50], "n_remind": sum(p["action"] == "REMIND" for p in plan),
                 "no_contact": no_contact, "reseller_no_split": no_split, "disputes": disputes}
 
@@ -201,6 +204,7 @@ def invoices(q: str = "", status: str = "", payer: str = "", kind: str = "", dat
         iso = TODAY().isoformat(); w, a = ["1=1"], []
         if q: w.append("(c.name LIKE ? OR i.invoice_no LIKE ? OR i.description LIKE ?)"); a += [f"%{q}%"] * 3
         if status == "overdue": w.append("i.status IN ('OPEN','PARTIAL') AND i.due_date<?"); a.append(iso)
+        elif status == "held": w.append("i.hold=1 AND i.status IN ('OPEN','PARTIAL')")
         elif status: w.append("i.status=?"); a.append(status)
         if payer: w.append("i.payer=?"); a.append(payer)
         if kind: w.append("i.kind=?"); a.append(kind)
@@ -238,6 +242,13 @@ def cancel(iid: int, b: Reason):
 def restore(iid: int):
     with _lock:
         ledger.restore_invoice(conn, iid); return {"ok": True}
+
+class ReleaseIn(BaseModel):
+    source: str | None = None; date_from: str | None = None; date_to: str | None = None; invoice_ids: list[int] | None = None
+
+@app.post("/api/invoices/release")
+def release(b: ReleaseIn):
+    with _lock: return {"released": ledger.release_hold(conn, b.source, b.date_from, b.date_to, b.invoice_ids)}
 
 @app.post("/api/invoices/{iid}/dispute")
 def dispute(iid: int, b: Reason):
@@ -317,6 +328,11 @@ def up_invoices(file: UploadFile = File(...), apply: bool = False): return _bulk
 
 @app.post("/api/upload/collections")
 def up_collections(file: UploadFile = File(...), apply: bool = False, reduce_wallet: bool = False): return _bulk("collections", file, apply, reduce_wallet=reduce_wallet)
+
+@app.post("/api/upload/deductions")
+def up_deductions(file: UploadFile = File(...), apply: bool = False, reduce_wallet: bool = False):
+    """Fortnightly/monthly file of balances deducted on the ops platform (the platform is not connected to this app)."""
+    return _bulk("collections", file, apply, reduce_wallet=reduce_wallet, default_mode="WALLET")
 
 @app.post("/api/upload/customers")
 def up_customers(file: UploadFile = File(...), apply: bool = False): return _bulk("customers", file, apply)
@@ -422,7 +438,7 @@ def test_send(b: TestSend):
 
 # ================================================================== zoho
 class ZohoPeriod(BaseModel):
-    start: str; end: str; create_customers: bool = True; include_paid: bool = True; invoice_ids: list[str] | None = None
+    start: str; end: str; create_customers: bool = True; include_paid: bool = True; invoice_ids: list[str] | None = None; hold_open: bool = True
 
 @app.post("/api/zoho/preview")
 def zoho_preview(b: ZohoPeriod):
@@ -443,7 +459,19 @@ def zoho_import(b: ZohoPeriod):
     with _lock:
         try: invs = z.invoices(b.start, b.end)
         except Exception as e: raise HTTPException(502, f"Zoho error: {str(e)[:200]}")
-        return zoho.import_invoices(conn, invs, b.create_customers, b.include_paid, set(b.invoice_ids) if b.invoice_ids else None)
+        return zoho.import_invoices(conn, invs, b.create_customers, b.include_paid, set(b.invoice_ids) if b.invoice_ids else None, b.hold_open)
+
+@app.post("/api/zoho/file")
+def zoho_file(file: UploadFile = File(...), apply: bool = False, create_customers: bool = True, include_paid: bool = True, hold_open: bool = True):
+    """Import from Zoho Books' own export (Invoices -> Export as CSV/XLSX). No API credentials needed."""
+    with _lock:
+        invs = zoho.invoices_from_rows(_err(lambda: importers.read_table(_save(file))))
+        if not invs: raise HTTPException(400, "no invoices found - export Invoices from Zoho Books (needs Invoice Number, Invoice Date, Customer Name, Total)")
+        if not apply:
+            pv = zoho.preview(conn, invs); c = {}
+            for r in pv: c[r["import_status"]] = c.get(r["import_status"], 0) + 1
+            return {"total": len(pv), "by_status": c, "sample": pv[:8]}
+        return zoho.import_invoices(conn, invs, create_customers, include_paid, None, hold_open)
 
 # ================================================================== migration (one time) / demo / settings
 @app.get("/api/migration/status")
