@@ -7,6 +7,7 @@ Single source of truth for customer receivables: invoices, collections (bank / w
 * **Resellers** (IDFC, Stride): an invoice is split into customer share and reseller share, each chased and settled separately.
 * **Zoho Books**: choose a period, preview, import *new* invoices; never trusted for paid/unpaid.
 * **Bulk Excel** for invoices, collections and customer data (validate, then apply). One-time migration of the old Excel files, then locked.
+* **Reports**: live dues matrix (old Summary SM), ageing, trend, KAM scorecard - with Excel export. Daily automatic backups.
 * **Reminders** from your Microsoft 365 mailbox and WhatsApp, with editable templates. Starts in dry-run.
 
 ## Run it

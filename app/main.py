@@ -4,7 +4,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import openpyxl
-from . import db, ledger, importers, reminders, zoho, channels, demo
+from . import db, ledger, importers, reminders, zoho, channels, demo, reports, backup
 
 app = FastAPI(title="Dues Control Room")
 _lock = threading.RLock()
@@ -348,6 +348,67 @@ def template(kind: str):
     return Response(importers.template_workbook(kind), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     headers={"Content-Disposition": f'attachment; filename="{kind}_template.xlsx"'})
 
+# ================================================================== reports / export / backup / hygiene
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+def _dl(data, name, mt=XLSX): return Response(data, media_type=mt, headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+@app.get("/api/reports/matrix")
+def r_matrix(kam: str = "", payer: str = ""):
+    with _lock: return reports.matrix(conn, kam, payer)
+
+@app.get("/api/reports/ageing")
+def r_ageing(kam: str = ""):
+    with _lock: return reports.ageing(conn, kam)
+
+@app.get("/api/reports/trend")
+def r_trend():
+    with _lock: return reports.trend(conn)
+
+@app.get("/api/reports/kam")
+def r_kam():
+    with _lock: return reports.kam_scorecard(conn)
+
+@app.get("/api/reports/matrix.xlsx")
+def r_matrix_x(kam: str = ""):
+    with _lock: return _dl(reports.matrix_xlsx(conn, kam), "dues_matrix.xlsx")
+
+@app.get("/api/reports/ageing.xlsx")
+def r_ageing_x(kam: str = ""):
+    with _lock: return _dl(reports.ageing_xlsx(conn, kam), "ageing.xlsx")
+
+@app.get("/api/export/all.xlsx")
+def export_all():
+    with _lock: return _dl(reports.all_data_xlsx(conn), "dues_all_data.xlsx")
+
+@app.get("/api/backup/status")
+def backup_status(): return {"latest": backup.latest()}
+
+@app.get("/api/backup/download")
+def backup_download():
+    with _lock:
+        path = backup.run(conn, tag="-manual")
+    return FileResponse(path, filename=os.path.basename(path), media_type="application/octet-stream")
+
+@app.get("/api/duplicates/customers")
+def duplicates():
+    with _lock:
+        return [[dict(r) for r in conn.execute(f"SELECT id,name,kam,email_to,(SELECT COUNT(*) FROM invoices WHERE customer_id=customers.id) invoices FROM customers WHERE id IN ({','.join('?'*len(g))})", g)] for g in ledger.duplicate_groups(conn)]
+
+class MergeIn(BaseModel):
+    into: int
+
+@app.post("/api/customers/{cid}/merge")
+def merge(cid: int, b: MergeIn):
+    with _lock:
+        _err(lambda: ledger.merge_customers(conn, cid, b.into)); return {"ok": True}
+
+class SendNow(BaseModel):
+    party: str; channels: list[str] | None = None
+
+@app.post("/api/reminders/send-now")
+def send_now(b: SendNow):
+    with _lock: return _err(lambda: reminders.send_now(conn, b.party, b.channels))
+
 # ================================================================== resellers
 @app.get("/api/resellers")
 def resellers():
@@ -540,7 +601,7 @@ def _daily_loop():
             n = datetime.datetime.now()
             if n.hour * 60 + n.minute >= 9 * 60 + 30 and db.get_settings(c).get("last_auto_run") != n.date().isoformat():
                 with _lock:
-                    reminders.run(c); db.set_setting(c, "last_auto_run", n.date().isoformat()); c.commit()
+                    backup.run(c, tag='-daily'); reminders.run(c); db.set_setting(c, "last_auto_run", n.date().isoformat()); c.commit()
         except Exception as e:
             print("scheduler error", e)
         time.sleep(300)

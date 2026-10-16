@@ -146,9 +146,31 @@ def compose(conn, party, stage, channel, today=None):
             "params": [ctx_t["customer"], ctx["total"], str(ctx["days"]), ctx["oldest_due"]]}
 
 # ------------------------------------------------------------------ run
+def _deliver(conn, s, mode, kind, pid, party, stage, ch, today=None):
+    """Compose + send (or dry-run) one message on one channel and log it. Returns status SENT | DRY_RUN | FAILED."""
+    m = compose(conn, party, stage, ch, today); status, err = "SENT", ""
+    if mode != "LIVE":
+        status = "DRY_RUN"
+    else:
+        try:
+            if ch == "EMAIL":
+                channels.send_email(s["sender_name"], s["sender_email"], m["to"], m["cc"], m["subject"], m["body"])
+            else:
+                channels.send_whatsapp(m["to"][0], m["subject"], m["params"])
+        except Exception as e:
+            status, err = "FAILED", str(e)[:300]
+    col = "customer_id" if kind == "CUSTOMER" else "reseller_id"
+    conn.execute(f"INSERT INTO reminder_log({col},stage,channel,sent_at,to_addr,cc_addr,outstanding,status,error,subject,body) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                 (pid, stage, ch, now(), "; ".join(m["to"]), "; ".join(m["cc"]), m["total"], status, err, m["subject"], m["body"][:4000]))
+    return status
+
+def _mode(s, send_mode=None):
+    return "DRY_RUN" if s["is_demo"] == "1" else (send_mode or s["send_mode"])    # demo data can never reach a real inbox
+
+_KEY = {"SENT": "sent", "DRY_RUN": "dry_run", "FAILED": "failed"}
+
 def run(conn, today=None, send_mode=None, limit=None):
-    s = get_settings(conn)
-    mode = "DRY_RUN" if s["is_demo"] == "1" else (send_mode or s["send_mode"])    # demo data can never reach a real inbox
+    s = get_settings(conn); mode = _mode(s, send_mode)
     res = {"auto_applied": [], "sent": 0, "dry_run": 0, "failed": 0, "skipped": 0}
     if s["auto_apply_wallet"] == "1":
         res["auto_applied"] = ledger.run_auto_apply(conn)
@@ -158,23 +180,28 @@ def run(conn, today=None, send_mode=None, limit=None):
             res["skipped"] += 1; continue
         if done >= cap:
             break
-        done += 1; col = "customer_id" if p["kind"] == "CUSTOMER" else "reseller_id"
+        done += 1
         for ch in p["channels"]:
-            m = compose(conn, p["party"], p["stage"], ch, today); status, err = "SENT", ""
-            if mode != "LIVE":
-                status = "DRY_RUN"
-            else:
-                try:
-                    if ch == "EMAIL":
-                        channels.send_email(s["sender_name"], s["sender_email"], m["to"], m["cc"], m["subject"], m["body"])
-                    else:
-                        channels.send_whatsapp(m["to"][0], m["subject"], m["params"])
-                except Exception as e:
-                    status, err = "FAILED", str(e)[:300]
-            conn.execute(f"INSERT INTO reminder_log({col},stage,channel,sent_at,to_addr,cc_addr,outstanding,status,error,subject,body) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                         (p["id"], p["stage"], ch, now(), "; ".join(m["to"]), "; ".join(m["cc"]), m["total"], status, err, m["subject"], m["body"][:4000]))
-            res[{"SENT": "sent", "DRY_RUN": "dry_run", "FAILED": "failed"}[status]] += 1
+            res[_KEY[_deliver(conn, s, mode, p["kind"], p["id"], p["party"], p["stage"], ch, today)]] += 1
         conn.commit()
     audit(conn, "reminder_run", json.dumps({k: (len(v) if isinstance(v, list) else v) for k, v in res.items()}) + f" mode={mode}")
     conn.commit()
     return res
+
+def send_now(conn, party, channels_wanted=None, today=None, send_mode=None):
+    """Ad-hoc reminder for ONE party right now. Ignores the gap/stage rules (a human decided) but still respects holds, disputes and
+    DRY_RUN / demo safety. Stage = what the ageing says (at least 1)."""
+    s = get_settings(conn); mode = _mode(s, send_mode); kind_c, pid = party.split(":"); pid = int(pid)
+    ctx, p, invs = build_context(conn, party, today)
+    if not invs:
+        raise ValueError("nothing chargeable to remind (no open invoices, or all are on hold / disputed)")
+    stage = max(1, stage_for(ctx["days"], _stages(s)))
+    have = {"EMAIL": bool(_emails(p["email_to"] if kind_c == "C" else p["contact_emails"])), "WHATSAPP": bool(channels.normalize_phone(p["whatsapp"]))}
+    chans = [c for c in (channels_wanted or ["EMAIL", "WHATSAPP"]) if have.get(c)]
+    if not chans:
+        raise ValueError("no usable contact detail for the requested channel(s)")
+    out = {}
+    for ch in chans:
+        out[ch] = _deliver(conn, s, mode, "CUSTOMER" if kind_c == "C" else "RESELLER", pid, party, stage, ch, today)
+    audit(conn, "reminder_now", f"{party} stage={stage} {out}"); conn.commit()
+    return {"stage": stage, "results": out}

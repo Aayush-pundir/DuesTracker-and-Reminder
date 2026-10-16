@@ -203,3 +203,45 @@ def test_zoho_file_without_customer_ids_never_cross_assigns(c):
     zoho.import_invoices(c, zoho.invoices_from_rows(rows))
     got = {r[0]: r[1] for r in c.execute("SELECT i.invoice_no, c.name FROM invoices i JOIN customers c ON c.id=i.customer_id")}
     assert got == {"A-1": "Acme Pvt Ltd", "B-1": "Other Co", "C-1": "Third Co"}
+
+# ---------------------------------------------------------------- reports, backup, merge, send-now
+from app import reports, backup
+
+def test_reports_tie_out_to_outstanding(c):
+    a = cust(c); b = cust(c, "B Ltd", kam="Sumit"); months(c, a, start="2026-05-01"); months(c, b, (500, 700), start="2026-06-01")
+    ledger.record_payment(c, a, 1000, "BANK")
+    m = reports.matrix(c); tot = ledger.outstanding(c, a) + ledger.outstanding(c, b)
+    assert m["grand"] == tot == sum(r["total"] for r in m["rows"]) and "2026-06" in m["months"] and "2026-05" not in m["months"]
+    ag = reports.ageing(c); assert ag["grand"] == tot and len(ag["totals"]) == 5
+    assert reports.matrix(c, kam="Sumit")["grand"] == 1200
+    assert reports.matrix_xlsx(c)[:2] == b"PK" and reports.all_data_xlsx(c)[:2] == b"PK"
+    assert sum(r["billed"] for r in reports.trend(c)) >= 0
+
+def test_backup_is_restorable_and_pruned(c, tmp_path, monkeypatch):
+    import sqlite3
+    monkeypatch.setenv("DUES_BACKUP_DIR", str(tmp_path)); cid = cust(c); months(c, cid)
+    for i in range(4): p = backup.run(c, keep=2, tag=f"-{i}")
+    assert len(list(tmp_path.glob("dues-*.db"))) == 2
+    assert sqlite3.connect(p).execute("SELECT COUNT(*) FROM invoices").fetchone()[0] == 3
+
+def test_merge_customers_moves_everything_and_blocks_clashes(c):
+    a = cust(c, "Alpha Pvt Ltd"); b = cust(c, "Alpha Private Limited", whatsapp="919800000009")
+    assert [sorted(g) for g in ledger.duplicate_groups(c)] == [sorted([a, b])]
+    ledger.create_invoice(c, a, 100, "2026-01-01", invoice_no="X1"); ledger.create_invoice(c, b, 50, "2026-02-01", invoice_no="Y1")
+    ledger.record_payment(c, b, 20, "BANK")
+    ledger.merge_customers(c, b, a)
+    assert c.execute("SELECT COUNT(*) FROM customers").fetchone()[0] == 1 and ledger.outstanding(c, a) == 130
+    assert c.execute("SELECT whatsapp FROM customers WHERE id=?", (a,)).fetchone()[0] in ("919900000001", "919800000009")
+    d = cust(c, "Alpha Foods"); ledger.create_invoice(c, d, 10, "2026-01-01", invoice_no="X1")
+    with pytest.raises(ValueError): ledger.merge_customers(c, d, a)
+
+def test_send_now_ignores_gap_but_respects_dryrun_and_holds(c):
+    cid = cust(c); ledger.create_invoice(c, cid, 5000, "2026-01-01")
+    c.execute("INSERT INTO reminder_log(customer_id,stage,channel,sent_at,status) VALUES(?,?,?,?,?)", (cid, 4, "EMAIL", db.now(), "SENT")); c.commit()
+    r = reminders.send_now(c, f"C:{cid}", ["EMAIL"]); assert r["results"] == {"EMAIL": "DRY_RUN"} and r["stage"] >= 1
+    c.execute("UPDATE invoices SET hold=1"); c.commit()
+    with pytest.raises(ValueError): reminders.send_now(c, f"C:{cid}")
+
+def test_bulk_customers_remind_flag_and_notes(c):
+    cust(c); rows = xl(["name", "remind", "notes"], [["Acme Pvt Ltd", "no", "legal case pending"]])
+    importers.bulk_customers(c, rows, apply=True); x = c.execute("SELECT remind, notes FROM customers").fetchone(); assert (x[0], x[1]) == (0, "legal case pending")

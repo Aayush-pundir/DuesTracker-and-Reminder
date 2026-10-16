@@ -28,6 +28,12 @@ Every settlement is a `payment` + `allocations` (oldest due first, or specific i
 * No API access yet? Export Invoices from Zoho Books (CSV/XLSX) and upload it in Invoices → Zoho card - same preview/import rules.
 * Reseller split for old dues: already reflected in the amounts in your sheet; the % in the app applies only to invoices created after migration.
 
+## Reports, safety and hygiene
+* **Reports tab** (`app/reports.py`): the *dues matrix* (customer × billing month - the live replacement of the Summary SM sheet, filter by KAM, Excel export), *ageing by customer* (Excel export), *billed vs collected* trend (12 months), *KAM scorecard*.
+* **Backups** (`app/backup.py`): SQLite online backup every day before the reminder run (14 kept in `data/backups`), plus *Backup now & download* and *Everything as Excel* in Admin. Restore = copy a backup over `data/dues.db`.
+* **Duplicate customers**: names are compared ignoring `Pvt/Private/Ltd/Limited`; Admin lists look-alikes and can merge them (invoices, receipts, notes, reminder history move; blocked if the same invoice exists on both).
+* **Send reminder now**: one click from a customer / reseller - ignores the gap rules, still honours holds, disputes and DRY_RUN.
+
 ## Reminders (`app/reminders.py`, `app/channels.py`)
 Parties = customers + resellers. Stages by days past oldest due date (`0:1,7:2,15:3,30:4`), repeat every 15 d, ≥5 d between contacts, dust ignored, **disputed invoices excluded**, **promise-to-pay pauses chasing** (broken promises surface for a call), KAM escalated in CC from stage 3, `max_per_run` go-live cap, DRY_RUN never advances stages and demo data can never be sent. Channels: e-mail (Microsoft Graph / SMTP) and WhatsApp (Cloud API templates) - see `docs/CHANNELS.md`. Messages are editable templates.
 

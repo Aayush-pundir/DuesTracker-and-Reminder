@@ -283,3 +283,34 @@ def confirm_bank_payment(conn, payment_id, party_str, tds=0.0):
     done, left = allocate(conn, payment_id)
     audit(conn, "bank_match", f"payment={payment_id} party={kind}:{pid} allocated={done} advance={left}"); conn.commit()
     return done, left
+
+
+# ------------------------------------------------------------------ data hygiene
+def name_key(n):
+    return " ".join(sorted(_norm(n)))
+
+def duplicate_groups(conn):
+    g = {}
+    for c in conn.execute("SELECT id,name FROM customers"):
+        g.setdefault(name_key(c["name"]), []).append(c["id"])
+    return [ids for k, ids in g.items() if k and len(ids) > 1]
+
+def merge_customers(conn, src, dst):
+    """Move everything of customer `src` into `dst` and delete `src`. Refuses if the same invoice would exist twice."""
+    if src == dst:
+        raise ValueError("cannot merge a customer into itself")
+    a, b = (conn.execute("SELECT * FROM customers WHERE id=?", (i,)).fetchone() for i in (src, dst))
+    if not a or not b:
+        raise ValueError("unknown customer")
+    clash = conn.execute("""SELECT s.invoice_no FROM invoices s JOIN invoices d ON d.customer_id=? AND d.payer=s.payer AND d.kind=s.kind AND d.period=s.period AND d.invoice_no=s.invoice_no
+                            WHERE s.customer_id=? LIMIT 3""", (dst, src)).fetchall()
+    if clash:
+        raise ValueError("both customers have invoice " + ", ".join(r[0] or "(no number)" for r in clash) + " - cancel the duplicate first")
+    for t in ("invoices", "payments", "notes", "reminder_log"):
+        conn.execute(f"UPDATE {t} SET customer_id=? WHERE customer_id=?", (dst, src))
+    fills = {k: a[k] for k in ("kam", "contact_person", "email_to", "email_cc", "whatsapp", "enterprise_id", "zoho_contact_id", "reseller_id") if not b[k] and a[k]}
+    if fills:
+        conn.execute("UPDATE customers SET " + ",".join(f"{k}=?" for k in fills) + " WHERE id=?", (*fills.values(), dst))
+    conn.execute("UPDATE customers SET wallet_balance=wallet_balance+? WHERE id=?", (a["wallet_balance"], dst))
+    conn.execute("DELETE FROM customers WHERE id=?", (src,))
+    audit(conn, "customer_merge", f"{a['name']} (#{src}) -> {b['name']} (#{dst})"); conn.commit()

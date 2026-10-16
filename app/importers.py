@@ -178,8 +178,8 @@ TEMPLATES = {
     "deductions": (["customer", "date", "amount", "reference", "invoice_no", "narration"],
                    [["Acme Retail Pvt Ltd", "2026-10-15", 5000, "OPS-BATCH-OCT-1", "", "Deducted from platform balance"]],
                    "Fortnightly / monthly file of balances deducted on the ops platform. Every row settles that customer's oldest dues (or the invoice_no given). Mode is WALLET automatically."),
-    "customers": (["name", "kam", "contact_person", "email_to", "email_cc", "whatsapp", "credit_days", "reseller", "reseller_share_pct", "wallet_balance", "collection_mode", "auto_debit_allowed", "status"],
-                  [["Acme Retail Pvt Ltd", "Tanisha Verma", "Ravi", "accounts@acme.com", "", "919810012345", 15, "", "", 0, "BANK", "yes", "ACTIVE"]],
+    "customers": (["name", "kam", "contact_person", "email_to", "email_cc", "whatsapp", "credit_days", "reseller", "reseller_share_pct", "wallet_balance", "collection_mode", "auto_debit_allowed", "remind", "status", "notes"],
+                  [["Acme Retail Pvt Ltd", "Tanisha Verma", "Ravi", "accounts@acme.com", "", "919810012345", 15, "", "", 0, "BANK", "yes", "yes", "ACTIVE", ""]],
                   "Upsert by name; blank cells are left unchanged. reseller_share_pct = % of each new invoice the reseller pays."),
 }
 
@@ -290,10 +290,11 @@ def bulk_customers(conn, rows, apply=False):
             name = r.get("name") or r.get("customer")
             if not name: raise ValueError("name required")
             f = {}
-            for k in ("kam", "contact_person", "email_to", "email_cc", "whatsapp", "status", "collection_mode"):
+            for k in ("kam", "contact_person", "email_to", "email_cc", "whatsapp", "status", "collection_mode", "notes"):
                 if r.get(k) not in (None, ""): f[k] = _clean(r[k]) if k not in ("email_to", "email_cc") else str(r[k]).strip()
             for k in ("credit_days", "reseller_share_pct", "wallet_balance"):
                 if r.get(k) not in (None, ""): f[k] = _num(r[k])
+            if r.get("remind") not in (None, ""): f["remind"] = 1 if str(r["remind"]).strip().lower() in ("yes", "y", "1", "true") else 0
             if r.get("auto_debit_allowed") not in (None, ""): f["auto_debit_allowed"] = 1 if str(r["auto_debit_allowed"]).strip().lower() in ("yes", "y", "1", "true") else 0
             if r.get("reseller"):
                 rid = _find_reseller(conn, r["reseller"])
