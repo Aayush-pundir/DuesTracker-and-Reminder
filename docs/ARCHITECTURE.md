@@ -1,43 +1,42 @@
 # Architecture
 
-## What the two Excel files told us
-| Sheet | Meaning | Becomes |
-|---|---|---|
-| Consol › Summary SM | customer × month matrix of **pending** spend-management dues (+ KAM, EnterpriseId) | `invoices(kind=SPEND_MGMT)` |
-| Consol › Other than S Mgt / Summary-OSM | invoice-level dues (invoice no., period, description, KAM) – min-guarantee, setup fees, gift cards | `invoices(kind=OTHER)` |
-| Consol › Spend Management | per-customer ops status: *Running balance low* / *Do not auto debit* / *IDFC First Bank*, enterprise e-mails | `customers.collection_mode`, `auto_debit_allowed`, contacts |
-| Consol › Stride Billing | billing for reseller-linked customers | reseller tag |
-| DuesReminder › DATA | To / CC e-mails, last "Sent" status | contacts |
-| DuesReminder › VBA | Outlook mailer behind a button | replaced by the reminder engine |
-
-Sanity check on the supplied files: imported outstanding = ₹1,32,16,398 = Summary SM ₹83.97 L + Other ₹48.19 L (matches the sheet totals).
+**Principle: the app is the single source of truth for receivables.** Excel is only for (a) a one-time migration and (b) bulk uploads of collections / invoices / customer data. Zoho only supplies *new* invoices.
 
 ## Data model (`app/db.py`)
-`customers` ─< `invoices` ─< `allocations` >─ `payments`; `resellers` ─< `customers`; `reminder_log`; `settings`; `audit`.
-* `payments.mode`: `BANK | WALLET | AUTO_DEBIT | CREDIT_NOTE | SNAPSHOT` (SNAPSHOT = closed because a newer Consol no longer lists it).
-* Invoice balance = `amount − Σ allocations`. Status (`OPEN/PARTIAL/CLOSED`) is recomputed after every allocation.
+`customers` ─< `invoices` ─< `allocations` >─ `payments`; `resellers` ─< `customers`; `notes`, `templates`, `reminder_log`, `settings`, `audit`.
+* **Credit terms** are per customer (`credit_days`, default 15 = *Net 15*). `due_date = invoice_date + credit_days`; changing a customer's terms recomputes their open invoices. Shown as a badge everywhere (amber when ≠ Net 15).
+* Invoice balance = `amount − Σ allocations`; status (`OPEN/PARTIAL/CLOSED`) is derived. `CANCELLED` is a soft delete (blocked while payments are allocated - reverse them first). Every change goes to `audit`.
+* **Reseller model** - a customer may have a reseller and a `reseller_share_pct`. Every new invoice is split into two rows sharing `split_group`: `payer=CUSTOMER` and `payer=RESELLER`. Each part has its own ageing, reminders and settlement. A reseller's reminder is *one consolidated statement* listing its customers.
+  The Consol workbook contains no explicit split percentages (only Stride Billing amounts, a "BBPS Integration-20%" note and "IDFC First Bank" ops tags), so the % is entered per customer (Today screen lists reseller customers still missing it).
 
-## The three collection mechanisms (`app/ledger.py`)
-1. **Bank statement** – upload CSV/XLSX. Each credit is hashed (re-upload safe) and matched to a customer by name tokens, boosted when the amount equals the customer's total or one invoice. Score ≥ 1.2 → applied automatically; otherwise it waits in the *review queue* for one click. Excess stays unapplied.
-2. **Held money on our platform (wallet)** – `wallet_balance` per customer; *Top-up* / *Deduct vs dues* in the UI. Never overdraws; undo returns the money.
-3. **Auto-debit** – daily job debits wallets of customers with `auto_debit_allowed=1` ("Do not auto debit" is respected), oldest dues first. In the reminder plan these customers get `AUTO_DEBIT` instead of an e-mail.
+## Three ways money arrives, one way invoices close (`app/ledger.py`)
+Every settlement is a `payment` + `allocations` (oldest due first, or specific invoice numbers): **BANK** (statement upload with fuzzy matching → auto-apply when confident, review queue otherwise; reseller payments matched too), **WALLET** deduction and **AUTO_DEBIT** (recorded from the ops platform via bulk upload / one-by-one; the wallet balance in the app is a mirror and is only auto-applied if `auto_apply_wallet=1`), plus **CREDIT_NOTE**, **TDS** (settles the invoice, reported separately) and **ZOHO** (already paid in Zoho). Excess money stays as an *advance* and is applied automatically to the next invoice raised. Any payment can be undone.
 
-Credit notes use the same allocation path. Any wrong entry can be reversed (invoices re-open).
+## Getting data in
+| Need | How |
+|---|---|
+| Initial history | Admin → one-time migration of Consol + DuesReminder files, then **Finish & lock** (endpoints return 409 afterwards) |
+| New invoices | Zoho: pick a period → preview → import (dedup by Zoho id and by invoice no.; Zoho's "unpaid" is never trusted; paid-in-Zoho can land closed). Or manual / bulk Excel (ADD, UPDATE, CANCEL) |
+| Collections | single form, bank statement, bulk Excel (mode, TDS, invoice no.) - all validate-then-apply |
+| Master data | customer drawer or bulk Excel (credit days, reseller & %, WhatsApp, e-mails, KAM) |
 
-## Reminders (`app/reminders.py`)
-Default policy: stage 1 at due+0 d, 2 at +7, 3 at +15, 4 at +30, then every 15 d; min 5 d between mails; balances < ₹100 ignored; KAM auto-CC'd from stage 3 (setting `kam_emails`, JSON `{"tanisha verma":"…"}`); max 40 customers per run (go-live safety). Each e-mail lists the open invoices with stage-specific tone; wallet customers get a top-up variant. DRY_RUN entries never advance stages.
+## Reminders (`app/reminders.py`, `app/channels.py`)
+Parties = customers + resellers. Stages by days past oldest due date (`0:1,7:2,15:3,30:4`), repeat every 15 d, ≥5 d between contacts, dust ignored, **disputed invoices excluded**, **promise-to-pay pauses chasing** (broken promises surface for a call), KAM escalated in CC from stage 3, `max_per_run` go-live cap, DRY_RUN never advances stages and demo data can never be sent. Channels: e-mail (Microsoft Graph / SMTP) and WhatsApp (Cloud API templates) - see `docs/CHANNELS.md`. Messages are editable templates.
 
-## Resellers (IDFC First Bank, Stride)
-Tagged automatically (name marker like `-IDFC`, or e-mail domain) and editable per customer. Dues stay on the **end customer**, roll up per reseller on the Resellers tab, and the reseller contact can be CC'd (`resellers.remind_reseller/contact_emails`). *Assumption – to be confirmed.*
+## What mature receivable tools do - and where this stands
+| Practice (Chaser, Upflow, HighRadius, Zoho dunning, Tally/Vyapar India) | Status |
+|---|---|
+| Staged dunning with tone escalation, channel mix | ✅ |
+| Promise-to-pay, dispute flags, collector notes/calls | ✅ |
+| Worklist of exceptions instead of a report | ✅ Today screen |
+| Ageing, DSO, collections by route | ✅ (CEI / forecast later) |
+| Customer statement of account | ✅ Excel (PDF later) |
+| TDS handling (India) | ✅ per receipt; Form 26AS reconciliation later |
+| Cash application / bank matching | ✅ fuzzy; UTR-in-narration & bank-feed later |
+| Pay-now link / UPI QR in message | ◻ `payment_link` setting is wired into e-mail; Razorpay per-invoice links later |
+| Customer self-service portal, e-mail-reply parsing ("paid, UTR…") | ◻ roadmap |
+| Credit limits / auto service-hold, risk score | ◻ roadmap |
+| GST e-invoice / IRN, interest on late payment | ◻ stays in Zoho / billing |
 
-## Zoho Books (`app/zoho.py`)
-Zoho stays the book of record: **pull** unpaid invoices (replaces the manual Consol upload) and **push** every settlement as a customer payment applied to the Zoho invoice, so it closes in both places. Written against the REST v3 API; **untested without credentials** – try in a sandbox first.
-
-## Rollout
-1. Import Consol, watch the *Reminders* plan in DRY_RUN for a week.
-2. Go live with a low `max_per_run` (~20): the first run would otherwise hit ~280 customers, many 180+ days overdue.
-3. Upload the bank statement daily (later: bank feed / Zoho bank rules).
-4. Connect Zoho, retire the Consol upload.
-
-## Known limits / next steps
-No login yet (keep behind VPN / auth proxy); single-process SQLite; bank-statement column detection is heuristic; no WhatsApp/SMS (`reminder_log.channel` ready); GST/TDS short-payments not modelled; KAM names in the source are inconsistent ("Tanisha" vs "Tanisha Verma") and should be normalised.
+## Known limits
+No login yet (put behind VPN / an auth proxy before others use it); single-process SQLite; Zoho / Microsoft Graph / WhatsApp code paths are untested against live accounts (Zoho field names were verified against a real invoice); bank-statement column detection is heuristic; later this merges into your billing utility - the `invoices` table and `/api/invoices` are the intended integration seam.

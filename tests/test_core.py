@@ -1,59 +1,168 @@
-import os, tempfile, datetime, pytest
+import os, tempfile, datetime, io, pytest
 os.environ["DUES_DB"] = os.path.join(tempfile.mkdtemp(), "t.db")
 os.environ["DUES_SCHEDULER"] = "0"
-from app import db, ledger, reminders
+import openpyxl
+from app import db, ledger, reminders, importers, zoho
 
 @pytest.fixture()
 def c():
-    conn = db.connect(); db.init(conn); conn.executescript("DELETE FROM allocations;DELETE FROM payments;DELETE FROM invoices;DELETE FROM customers;DELETE FROM reminder_log;")
+    conn = db.connect(); db.init(conn); db.wipe_business_data(conn)
+    for k in ("is_demo", "migration_done"): db.set_setting(conn, k, "0")
+    db.set_setting(conn, "channel_whatsapp", "0"); conn.commit()
     yield conn
     conn.close()
 
-def mk(conn, name="Acme Pvt Ltd", amounts=(1000, 2000, 3000), start="2025-01-01", **kw):
-    cid = conn.execute("INSERT INTO customers(name,email_to,kam) VALUES(?,?,?)", (name, "a@acme.com", "Tanisha")).lastrowid
+def cust(conn, name="Acme Pvt Ltd", **kw):
+    cid = conn.execute("INSERT INTO customers(name,email_to,kam,whatsapp) VALUES(?,?,?,?)", (name, "a@acme.example", "Tanisha", "919900000001")).lastrowid
     for k, v in kw.items(): conn.execute(f"UPDATE customers SET {k}=? WHERE id=?", (v, cid))
-    y, m = int(start[:4]), int(start[5:7])
-    for i, a in enumerate(amounts):
-        mm = (m - 1 + i) % 12 + 1; yy = y + (m - 1 + i) // 12
-        conn.execute("INSERT INTO invoices(customer_id,kind,period,amount,due_date) VALUES(?,?,?,?,?)", (cid, "SPEND_MGMT", f"{yy}-{mm:02d}-01", a, f"{yy}-{mm:02d}-28"))
     conn.commit(); return cid
 
-def test_fifo_allocation_closes_oldest_first(c):
-    cid = mk(c); pid, done, left = ledger.record_payment(c, cid, 2500, "BANK")
-    st = [r["status"] for r in c.execute("SELECT status FROM invoices ORDER BY period")]
-    assert st == ["CLOSED", "PARTIAL", "OPEN"] and done == 2500 and left == 0
-    assert ledger.outstanding(c, cid) == 3500
+def months(conn, cid, amounts=(1000, 2000, 3000), start="2025-01-01"):
+    y, m = int(start[:4]), int(start[5:7]); out = []
+    for i, a in enumerate(amounts):
+        mm = (m - 1 + i) % 12 + 1; yy = y + (m - 1 + i) // 12
+        out += ledger.create_invoice(conn, cid, a, f"{yy}-{mm:02d}-28", "SPEND_MGMT", f"I{yy}{mm:02d}")
+    return out
 
-def test_reverse_reopens(c):
-    cid = mk(c); pid, *_ = ledger.record_payment(c, cid, 6000, "BANK"); assert ledger.outstanding(c, cid) == 0
+# ---------------------------------------------------------------- invoices & credit terms
+def test_due_date_uses_customer_credit_days(c):
+    a = cust(c, credit_days=15); b = cust(c, "B Ltd", credit_days=45)
+    ia = ledger.create_invoice(c, a, 100, "2026-01-10")[0]; ib = ledger.create_invoice(c, b, 100, "2026-01-10")[0]
+    d = lambda i: c.execute("SELECT due_date FROM invoices WHERE id=?", (i,)).fetchone()[0]
+    assert d(ia) == "2026-01-25" and d(ib) == "2026-02-24"
+    c.execute("UPDATE customers SET credit_days=30 WHERE id=?", (a,)); ledger.recompute_due_dates(c, a)
+    assert d(ia) == "2026-02-09"
+
+def test_reseller_split_creates_two_independent_receivables(c):
+    rid = c.execute("SELECT id FROM resellers WHERE name='IDFC FIRST Bank'").fetchone()[0]
+    cid = cust(c, reseller_id=rid, reseller_share_pct=50)
+    ids = ledger.create_invoice(c, cid, 100, "2026-01-01", invoice_no="INV1")
+    assert len(ids) == 2
+    assert ledger.outstanding(c, cid, "CUSTOMER") == 50 and ledger.outstanding(c, cid, "RESELLER") == 50 and ledger.reseller_outstanding(c, rid) == 50
+    ledger.record_payment(c, cid, 50, "BANK")                      # customer pays its half
+    assert ledger.outstanding(c, cid, "CUSTOMER") == 0 and ledger.reseller_outstanding(c, rid) == 50
+    ledger.record_payment(c, None, 50, "BANK", reseller_id=rid)    # reseller pays its half
+    assert [r[0] for r in c.execute("SELECT status FROM invoices ORDER BY id")] == ["CLOSED", "CLOSED"]
+
+def test_fifo_tds_and_reverse(c):
+    cid = cust(c); months(c, cid)
+    pid, done, left = ledger.record_payment(c, cid, 1450, "BANK", tds=50)       # 1450 cash + 50 TDS closes first invoice + part of second
+    assert done == 1500 and [r[0] for r in c.execute("SELECT status FROM invoices ORDER BY invoice_date")] == ["CLOSED", "PARTIAL", "OPEN"]
     ledger.reverse_payment(c, pid); assert ledger.outstanding(c, cid) == 6000
 
-def test_wallet_deduct_never_overdraws_and_autodebit_respects_flag(c):
-    a = mk(c, "A Ltd", wallet_balance=1500, collection_mode="WALLET"); b = mk(c, "B Ltd", wallet_balance=9999, collection_mode="WALLET", auto_debit_allowed=0)
-    ledger.run_auto_debit(c)
-    assert ledger.outstanding(c, a) == 4500 and c.execute("SELECT wallet_balance FROM customers WHERE id=?", (a,)).fetchone()[0] == 0
-    assert ledger.outstanding(c, b) == 6000   # "Do not auto debit" honoured
+def test_advance_is_applied_to_next_invoice(c):
+    cid = cust(c); ledger.record_payment(c, cid, 700, "BANK")                    # nothing to settle yet
+    assert c.execute("SELECT COUNT(*) FROM allocations").fetchone()[0] == 0
+    ledger.create_invoice(c, cid, 1000, "2026-03-01")
+    assert ledger.outstanding(c, cid) == 300
 
-def test_bank_matching_idempotent(c):
-    cid = mk(c, "Zenith Logistics Private Limited", amounts=(5000,))
-    rows = [{"date": "2026-01-02", "amount": 5000, "narration": "NEFT ZENITH LOGISTICS PVT LTD", "reference": "U1"},
-            {"date": "2026-01-02", "amount": 70, "narration": "random credit", "reference": "U2"}]
-    s = ledger.import_bank_rows(c, rows); assert s["auto_applied"] == 1 and s["unmatched"] == 1
-    assert ledger.outstanding(c, cid) == 0
-    assert ledger.import_bank_rows(c, rows)["duplicate"] == 2
+def test_cancel_edit_rules(c):
+    cid = cust(c); i = ledger.create_invoice(c, cid, 1000, "2026-03-01")[0]
+    ledger.record_payment(c, cid, 400, "BANK")
+    with pytest.raises(ValueError): ledger.cancel_invoice(c, i)
+    with pytest.raises(ValueError): ledger.update_invoice(c, i, amount=300)
+    ledger.update_invoice(c, i, amount=900); assert ledger.outstanding(c, cid) == 500
+    p = c.execute("SELECT id FROM payments").fetchone()[0]; ledger.reverse_payment(c, p)
+    ledger.cancel_invoice(c, i, "raised by mistake"); assert ledger.outstanding(c, cid) == 0
 
-def test_reminder_stages_and_no_spam(c):
-    cid = mk(c, amounts=(5000,), start="2026-01-01")      # due 2026-01-28
-    today = datetime.date(2026, 2, 5)                       # 8 days overdue -> stage 2
-    p = [x for x in reminders.plan(c, today) if x["customer_id"] == cid][0]; assert p["action"] == "REMIND" and p["stage"] == 2
-    reminders.run(c, today, send_mode="DRY_RUN")            # dry run must not advance stages
-    assert [x for x in reminders.plan(c, today) if x["customer_id"] == cid][0]["action"] == "REMIND"
-    c.execute("INSERT INTO reminder_log(customer_id,stage,sent_at,status) VALUES(?,?,?,?)", (cid, 2, "2026-02-05T09:00:00", "SENT"))
-    assert reminders.plan(c, datetime.date(2026, 2, 8))[0]["action"] == "SKIP"            # min gap
-    assert reminders.plan(c, datetime.date(2026, 2, 20))[0]["stage"] == 3                 # escalates
-    c.execute("UPDATE customers SET email_to='' WHERE id=?", (cid,))
-    assert reminders.plan(c, datetime.date(2026, 3, 20))[0]["action"] == "SKIP"
+def test_wallet_never_overdraws(c):
+    cid = cust(c, wallet_balance=1500); months(c, cid)
+    assert ledger.apply_wallet(c, cid) == 1500 and ledger.outstanding(c, cid) == 4500
+    assert c.execute("SELECT wallet_balance FROM customers").fetchone()[0] == 0
 
-def test_wallet_customer_gets_autodebit_not_reminder(c):
-    cid = mk(c, amounts=(5000,), start="2026-01-01", wallet_balance=8000)
-    assert reminders.plan(c, datetime.date(2026, 3, 1))[0]["action"] == "AUTO_DEBIT"
+# ---------------------------------------------------------------- bank
+def test_bank_matching_customer_and_reseller_idempotent(c):
+    cid = cust(c, "Zenith Logistics Private Limited"); ledger.create_invoice(c, cid, 5000, "2026-01-01")
+    rid = c.execute("SELECT id FROM resellers WHERE name='IDFC FIRST Bank'").fetchone()[0]
+    c2 = cust(c, "Beta Foods Pvt Ltd", reseller_id=rid, reseller_share_pct=100); ledger.create_invoice(c, c2, 8000, "2026-01-01")
+    rows = [{"date": "2026-02-02", "amount": 5000, "narration": "NEFT ZENITH LOGISTICS PVT LTD", "reference": "U1"},
+            {"date": "2026-02-02", "amount": 8000, "narration": "RTGS IDFC FIRST BANK LTD", "reference": "U2"},
+            {"date": "2026-02-02", "amount": 70, "narration": "random credit", "reference": "U3"}]
+    s = ledger.import_bank_rows(c, rows); assert s["auto_applied"] == 2 and s["unmatched"] == 1
+    assert ledger.outstanding(c, cid) == 0 and ledger.reseller_outstanding(c, rid) == 0
+    assert ledger.import_bank_rows(c, rows)["duplicate"] == 3
+
+# ---------------------------------------------------------------- bulk uploads
+def xl(header, rows):
+    wb = openpyxl.Workbook(); ws = wb.active; ws.append(header); [ws.append(r) for r in rows]
+    p = os.path.join(tempfile.mkdtemp(), "x.xlsx"); wb.save(p); return importers.read_table(p)
+
+def test_bulk_collections_validate_then_apply(c):
+    cid = cust(c); months(c, cid)
+    rows = xl(["customer", "date", "mode", "amount", "tds", "reference", "invoice_no"],
+              [["Acme Pvt Ltd", "2025-04-02", "BANK", 1000, 0, "U1", "I202501"], ["Nobody Ltd", "2025-04-02", "BANK", 5, 0, "", ""],
+               ["Acme Pvt Ltd", "2025-04-03", "WALLET", 1900, 100, "OPS1", ""]])
+    r = importers.bulk_collections(c, rows, apply=False); assert r["ok"] == 2 and len(r["errors"]) == 1
+    assert ledger.outstanding(c, cid) == 6000                                    # preview changed nothing
+    r = importers.bulk_collections(c, rows, apply=True); assert ledger.outstanding(c, cid) == 3000
+
+def test_bulk_invoices_add_update_cancel(c):
+    cid = cust(c)
+    rows = xl(["customer", "invoice_no", "invoice_date", "amount", "description", "kind", "action"],
+              [["Acme Pvt Ltd", "N1", "2026-05-01", 1000, "x", "OTHER", "ADD"], ["Acme Pvt Ltd", "N2", "2026-05-01", 500, "", "OTHER", "ADD"],
+               ["Acme Pvt Ltd", "N1", "", 1200, "", "", "UPDATE"], ["Acme Pvt Ltd", "N2", "", "", "", "", "CANCEL"], ["Acme Pvt Ltd", "N9", "", "", "", "", "CANCEL"]])
+    r = importers.bulk_invoices(c, rows[:2], apply=True); assert r["ok"] == 2
+    r = importers.bulk_invoices(c, rows[2:], apply=True); assert r["ok"] == 2 and len(r["errors"]) == 1
+    assert ledger.outstanding(c, cid) == 1200
+
+def test_bulk_customers_sets_terms_and_split(c):
+    cust(c)
+    rows = xl(["name", "credit_days", "reseller", "reseller_share_pct", "whatsapp", "auto_debit_allowed"], [["Acme Pvt Ltd", 30, "IDFC FIRST Bank", 40, "9810012345", "no"], ["New Co", 15, "", "", "", ""]])
+    r = importers.bulk_customers(c, rows, apply=True); assert r["ok"] == 2
+    x = c.execute("SELECT * FROM customers WHERE name='Acme Pvt Ltd'").fetchone(); assert (x["credit_days"], x["reseller_share_pct"], x["auto_debit_allowed"]) == (30, 40, 0)
+    assert c.execute("SELECT credit_days FROM customers WHERE name='New Co'").fetchone()[0] == 15
+
+# ---------------------------------------------------------------- zoho
+class FakeZoho:
+    def invoices(self, s, e):
+        mk = lambda i, n, st, bal, d="2026-09-30": dict(invoice_id=i, customer_id="Z1", customer_name="Acme Pvt Ltd", invoice_number=n, date=d, due_date=d, total=1000, balance=bal, status=st, last_payment_date="2026-10-05", email="a@x")
+        return [mk("1", "ZI-1", "sent", 1000), mk("2", "ZI-2", "paid", 0), mk("3", "OLD-1", "sent", 1000), mk("4", "ZI-4", "draft", 1000)]
+
+def test_zoho_import_links_existing_closes_paid_and_is_idempotent(c):
+    cid = cust(c); ledger.create_invoice(c, cid, 1000, "2026-09-01", invoice_no="OLD-1")
+    z = FakeZoho().invoices("", ""); pv = {r["number"]: r["import_status"] for r in zoho.preview(c, z)}
+    assert pv == {"ZI-1": "NEW", "ZI-2": "NEW", "OLD-1": "LINK_EXISTING", "ZI-4": "IGNORED"}
+    r = zoho.import_invoices(c, z); assert (r["created"], r["linked"], r["closed_as_paid"]) == (2, 1, 1)
+    assert ledger.outstanding(c, cid) == 2000                                  # OLD-1 + ZI-1 open, ZI-2 closed as paid
+    r2 = zoho.import_invoices(c, z); assert r2["created"] == 0                  # nothing duplicated
+
+# ---------------------------------------------------------------- reminders
+def test_stages_dryrun_gap_and_promise(c):
+    cid = cust(c); ledger.create_invoice(c, cid, 5000, "2026-01-01")        # due 2026-01-16
+    day = datetime.date(2026, 1, 24)                                            # 8 days overdue -> stage 2
+    p = [x for x in reminders.plan(c, day) if x["id"] == cid][0]; assert p["action"] == "REMIND" and p["stage"] == 2 and p["channels"] == ["EMAIL"]
+    reminders.run(c, day, send_mode="DRY_RUN")
+    assert [x for x in reminders.plan(c, day) if x["id"] == cid][0]["action"] == "REMIND"      # dry-run does not advance
+    c.execute("INSERT INTO reminder_log(customer_id,stage,channel,sent_at,status) VALUES(?,?,?,?,?)", (cid, 2, "EMAIL", "2026-01-24T09:00:00", "SENT"))
+    assert reminders.plan(c, datetime.date(2026, 1, 27))[0]["reason"].startswith("contacted")
+    assert reminders.plan(c, datetime.date(2026, 2, 10))[0]["stage"] == 3
+    c.execute("UPDATE customers SET promise_date='2026-02-20' WHERE id=?", (cid,))
+    assert "promised" in reminders.plan(c, datetime.date(2026, 2, 10))[0]["reason"]
+
+def test_disputed_invoice_not_chased_and_whatsapp_channel(c):
+    cid = cust(c); i = ledger.create_invoice(c, cid, 5000, "2026-01-01")[0]; ledger.set_dispute(c, i, True, "outage")
+    assert reminders.plan(c, datetime.date(2026, 3, 1)) == []                   # only invoice is disputed
+    ledger.set_dispute(c, i, False); db.set_setting(c, "channel_whatsapp", "1")
+    p = reminders.plan(c, datetime.date(2026, 3, 1))[0]; assert p["channels"] == ["EMAIL", "WHATSAPP"]
+    m = reminders.compose(c, p["party"], p["stage"], "WHATSAPP", datetime.date(2026, 3, 1))
+    assert m["subject"] == "dues_reminder_4" and m["params"][1] == "5,000"
+
+def test_reseller_gets_own_consolidated_reminder(c):
+    rid = c.execute("SELECT id FROM resellers WHERE name='IDFC FIRST Bank'").fetchone()[0]
+    c.execute("UPDATE resellers SET contact_emails='ops@idfc.example' WHERE id=?", (rid,))
+    cid = cust(c, reseller_id=rid, reseller_share_pct=50); ledger.create_invoice(c, cid, 10000, "2026-01-01", invoice_no="B1")
+    plan = {x["party"]: x for x in reminders.plan(c, datetime.date(2026, 3, 1))}
+    assert plan[f"R:{rid}"]["total"] == 5000 and plan[f"C:{cid}"]["total"] == 5000
+    m = reminders.compose(c, f"R:{rid}", 4, "EMAIL", datetime.date(2026, 3, 1)); assert "Acme Pvt Ltd" in m["body"] and m["to"] == ["ops@idfc.example"]
+
+def test_demo_mode_never_sends_live(c):
+    cid = cust(c); ledger.create_invoice(c, cid, 5000, "2026-01-01"); db.set_setting(c, "is_demo", "1")
+    r = reminders.run(c, datetime.date(2026, 3, 1), send_mode="LIVE"); assert r["dry_run"] >= 1 and r["sent"] == 0
+
+def test_template_sandbox_blocks_unsafe_expressions(c):
+    cid = cust(c); ledger.create_invoice(c, cid, 5000, "2026-01-01")
+    c.execute("UPDATE templates SET body=? WHERE key='EMAIL:1'", ("{{ ''.__class__.__mro__[1].__subclasses__() }}",))
+    with pytest.raises(Exception): reminders.compose(c, f"C:{cid}", 1, "EMAIL")
+
+def test_indian_number_format():
+    assert reminders.inr(709855) == "7,09,855" and reminders.inr(1796313) == "17,96,313" and reminders.inr(950) == "950"

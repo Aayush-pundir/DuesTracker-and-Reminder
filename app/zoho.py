@@ -1,15 +1,19 @@
-"""Zoho Books connector (REST v3, OAuth2 refresh-token flow). Credentials via environment only:
-ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN, ZOHO_ORG_ID, optional ZOHO_DC (com|in|eu, default in).
-NOTE: written against Zoho's documented API but NOT yet exercised against a live org - validate in a sandbox first.
+"""Zoho Books connector (REST v3, OAuth2 refresh-token). Credentials via environment only:
+ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN, ZOHO_ORG_ID, optional ZOHO_DC (in|com|eu, default in).
 
-Direction of sync (Zoho stays the book of record for invoices & receipts):
-  pull_open_invoices()  Zoho -> app   open invoices become dues (replaces the manual Consol upload)
-  push_payment()        app  -> Zoho  every bank/wallet/auto-debit settlement is posted as a customer payment
-                                      applied to the Zoho invoice, so the invoice closes in Zoho as well
-"""
+Role of Zoho in this system: it is the *source of NEW invoices only*. The app is the source of truth for receivables, because
+payments were historically not marked as received in Zoho. So:
+  * you pick a period; we fetch the invoices Zoho raised in it (preview first), and import the ones not already here;
+  * Zoho's paid/unpaid flag is NOT trusted for open invoices - they land as open and are closed here via bank / wallet / bulk uploads;
+  * invoices Zoho shows as fully paid can optionally be imported already closed (payment mode ZOHO);
+  * an invoice number that already exists in the app (e.g. migrated from Excel) is linked, not duplicated;
+  * due date = invoice date + the customer's credit days (Net 15 by default), not Zoho's due date.
+Field names were checked against a live Zoho Books organisation (invoice_id, customer_id, customer_name, invoice_number, date,
+due_date, total, balance, status, last_payment_date). The OAuth flow itself needs your credentials and is untested."""
 import os, time
 import httpx
-from .db import get_settings
+from . import ledger
+from .db import audit, get_settings
 
 class ZohoNotConfigured(RuntimeError):
     pass
@@ -19,7 +23,7 @@ class Zoho:
         self.dc = os.environ.get("ZOHO_DC", "in")
         need = ["ZOHO_CLIENT_ID", "ZOHO_CLIENT_SECRET", "ZOHO_REFRESH_TOKEN", "ZOHO_ORG_ID"]
         if any(not os.environ.get(k) for k in need):
-            raise ZohoNotConfigured("Set " + ", ".join(need))
+            raise ZohoNotConfigured("set " + ", ".join(need))
         self.org = os.environ["ZOHO_ORG_ID"]; self._tok = None; self._exp = 0
 
     def _token(self):
@@ -31,48 +35,77 @@ class Zoho:
         r.raise_for_status(); j = r.json(); self._tok = j["access_token"]; self._exp = time.time() + j.get("expires_in", 3600) - 60
         return self._tok
 
-    def _req(self, method, path, **kw):
-        r = httpx.request(method, f"https://www.zohoapis.{self.dc}/books/v3/{path}", params={"organization_id": self.org, **kw.pop("params", {})},
-                          headers={"Authorization": f"Zoho-oauthtoken {self._token()}"}, timeout=60, **kw)
-        r.raise_for_status(); return r.json()
-
-    def open_invoices(self):
+    def invoices(self, start, end):
+        """All invoices dated start..end (inclusive), any status."""
         page, out = 1, []
         while True:
-            j = self._req("GET", "invoices", params={"status": "unpaid", "page": page, "per_page": 200})
-            out += j["invoices"]
-            if not j["page_context"]["has_more_page"]:
+            r = httpx.get(f"https://www.zohoapis.{self.dc}/books/v3/invoices", timeout=60,
+                          headers={"Authorization": f"Zoho-oauthtoken {self._token()}"},
+                          params={"organization_id": self.org, "date_start": start, "date_end": end, "page": page, "per_page": 200})
+            r.raise_for_status(); j = r.json(); out += j["invoices"]
+            if not j["page_context"].get("has_more_page"):
                 return out
             page += 1
 
-    def create_payment(self, contact_id, invoice_id, amount, date, mode="banktransfer", reference=""):
-        return self._req("POST", "customerpayments", json={"customer_id": contact_id, "payment_mode": mode, "amount": amount, "date": date,
-                         "reference_number": reference, "invoices": [{"invoice_id": invoice_id, "amount_applied": amount}]})
+def _match_customer(conn, inv):
+    r = conn.execute("SELECT id FROM customers WHERE zoho_contact_id=?", (inv["customer_id"],)).fetchone()
+    if not r:
+        r = conn.execute("SELECT id FROM customers WHERE lower(trim(name))=lower(trim(?))", (inv["customer_name"],)).fetchone()
+    return r["id"] if r else None
 
-def pull_open_invoices(conn, zoho=None):
-    """Upsert Zoho unpaid invoices as app invoices (match customer by zoho_contact_id, else by name)."""
-    z = zoho or Zoho(); s = get_settings(conn); n = 0
-    for inv in z.open_invoices():
-        c = conn.execute("SELECT id FROM customers WHERE zoho_contact_id=? OR lower(name)=lower(?)", (inv["customer_id"], inv["customer_name"])).fetchone()
-        cid = c["id"] if c else conn.execute("INSERT INTO customers(name,zoho_contact_id) VALUES(?,?)", (inv["customer_name"], inv["customer_id"])).lastrowid
-        conn.execute("UPDATE customers SET zoho_contact_id=? WHERE id=?", (inv["customer_id"], cid))
-        period = inv["date"][:7] + "-01"
-        row = conn.execute("SELECT id FROM invoices WHERE zoho_invoice_id=?", (inv["invoice_id"],)).fetchone()
-        if row:
-            paid = conn.execute("SELECT COALESCE(SUM(amount),0) FROM allocations WHERE invoice_id=?", (row["id"],)).fetchone()[0]
-            conn.execute("UPDATE invoices SET amount=?, due_date=? WHERE id=?", (inv["balance"] + paid, inv["due_date"], row["id"]))
-        else:
-            conn.execute("INSERT OR IGNORE INTO invoices(customer_id,kind,period,invoice_no,amount,due_date,zoho_invoice_id,description) VALUES(?,?,?,?,?,?,?,?)",
-                         (cid, "OTHER", period, inv["invoice_number"], inv["balance"], inv["due_date"], inv["invoice_id"], "Zoho"))
-        n += 1
-    conn.commit(); return n
+def classify(conn, inv):
+    if inv["status"] in ("draft", "void"):
+        return "IGNORED", None
+    if conn.execute("SELECT 1 FROM invoices WHERE zoho_invoice_id=?", (inv["invoice_id"],)).fetchone():
+        return "ALREADY_IMPORTED", None
+    cid = _match_customer(conn, inv)
+    if cid and conn.execute("SELECT 1 FROM invoices WHERE customer_id=? AND invoice_no=? AND status!='CANCELLED'", (cid, inv["invoice_number"])).fetchone():
+        return "LINK_EXISTING", cid
+    return ("NEW" if cid else "NEW_CUSTOMER"), cid
 
-def push_payment(conn, payment_id, zoho=None):
-    z = zoho or Zoho()
-    p = conn.execute("SELECT * FROM payments WHERE id=?", (payment_id,)).fetchone()
-    c = conn.execute("SELECT zoho_contact_id FROM customers WHERE id=?", (p["customer_id"],)).fetchone()
-    for a in conn.execute("SELECT a.amount, i.zoho_invoice_id FROM allocations a JOIN invoices i ON i.id=a.invoice_id WHERE a.payment_id=?", (payment_id,)):
-        if a["zoho_invoice_id"] and c["zoho_contact_id"]:
-            r = z.create_payment(c["zoho_contact_id"], a["zoho_invoice_id"], a["amount"], p["received_on"], reference=p["reference"])
-            conn.execute("UPDATE payments SET zoho_payment_id=? WHERE id=?", (r["payment"]["payment_id"], payment_id))
-    conn.commit()
+def preview(conn, zoho_invoices):
+    rows = []
+    for inv in zoho_invoices:
+        st, _ = classify(conn, inv)
+        rows.append({"invoice_id": inv["invoice_id"], "number": inv["invoice_number"], "customer": inv["customer_name"], "date": inv["date"],
+                     "total": inv["total"], "zoho_status": inv["status"], "import_status": st})
+    return rows
+
+def import_invoices(conn, zoho_invoices, create_customers=True, include_paid=True, only_ids=None):
+    res = {"created": 0, "linked": 0, "closed_as_paid": 0, "new_customers": 0, "skipped": 0, "errors": []}
+    dc = int(get_settings(conn)["default_credit_days"])
+    for inv in zoho_invoices:
+        if only_ids is not None and inv["invoice_id"] not in only_ids:
+            continue
+        st, cid = classify(conn, inv)
+        try:
+            if st in ("IGNORED", "ALREADY_IMPORTED") or (inv["status"] == "paid" and not include_paid and st != "LINK_EXISTING"):
+                res["skipped"] += 1; continue
+            if st == "LINK_EXISTING":
+                conn.execute("UPDATE invoices SET zoho_invoice_id=? WHERE customer_id=? AND invoice_no=?", (inv["invoice_id"], cid, inv["invoice_number"]))
+                conn.execute("UPDATE customers SET zoho_contact_id=COALESCE(zoho_contact_id,?) WHERE id=?", (inv["customer_id"], cid))
+                res["linked"] += 1; continue
+            if st == "NEW_CUSTOMER":
+                if not create_customers:
+                    res["skipped"] += 1; continue
+                cid = conn.execute("INSERT INTO customers(name,credit_days,email_to) VALUES(?,?,?)", (inv["customer_name"].strip(), dc, inv.get("email") or "")).lastrowid
+                res["new_customers"] += 1
+            conn.execute("UPDATE customers SET zoho_contact_id=COALESCE(zoho_contact_id,?) WHERE id=?", (inv["customer_id"], cid))
+            ids = ledger.create_invoice(conn, cid, inv["total"], inv["date"], "BILLING", inv["invoice_number"], inv.get("reference_number") or "",
+                                        source="ZOHO", zoho_invoice_id=inv["invoice_id"], commit=False)
+            res["created"] += 1
+            paid = round(inv["total"] - (inv.get("balance") or 0), 2) if inv["status"] in ("paid", "partially_paid") else 0
+            if paid > 0 and include_paid:
+                for iid in ids:
+                    row = conn.execute("SELECT i.*, c.reseller_id FROM invoices i JOIN customers c ON c.id=i.customer_id WHERE i.id=?", (iid,)).fetchone()
+                    take = min(paid, row["amount"])
+                    if take > 0:
+                        ledger.record_payment(conn, None if row["payer"] == "RESELLER" else cid, take, "ZOHO",
+                                              inv.get("last_payment_date") or inv["date"], "Settled in Zoho", invoice_ids=[iid],
+                                              reseller_id=row["reseller_id"] if row["payer"] == "RESELLER" else None, source="ZOHO", commit=False)
+                        paid -= take
+                res["closed_as_paid"] += 1
+        except Exception as e:
+            res["errors"].append(f"{inv.get('invoice_number')}: {e}")
+    audit(conn, "zoho_import", str({k: v for k, v in res.items() if k != "errors"})); conn.commit()
+    return res
